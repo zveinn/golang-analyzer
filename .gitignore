@@ -4,6 +4,7 @@ Cargo.lock
 *.log
 # Go test data (we may generate some)
 /testdata
+/client/target/
 # Editor
 .idea/
 .vscode/
