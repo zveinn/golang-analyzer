@@ -397,6 +397,17 @@
 .badge-stdlib { background: rgba(165, 180, 252, 0.14); color: var(--stdlib); }
 .badge-goroutine { background: rgba(192, 132, 252, 0.16); color: var(--goroutine); }
 .badge-loop { background: rgba(250, 204, 21, 0.14); color: var(--loop); }
+.badge-traced { background: rgba(52, 211, 153, 0.14); color: #34d399; border: 1px solid rgba(52, 211, 153, 0.3); }
+
+.root-params {
+  margin-left: 8px;
+  font-size: 11px;
+  color: #34d399;
+  background: rgba(52, 211, 153, 0.08);
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid rgba(52, 211, 153, 0.2);
+}
 .badge-recursive { background: rgba(248, 113, 113, 0.14); color: #f87171; }
 
 .row-count {

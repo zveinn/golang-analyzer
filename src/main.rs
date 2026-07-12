@@ -54,6 +54,8 @@ enum Callee {
 struct CallInfo {
     callee: Callee,
     goroutine: bool,
+    /// Raw source text of each argument expression at the call site (for tracing).
+    args: Vec<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -61,6 +63,9 @@ struct CallInfo {
 enum BodyElement {
     Call { info: CallInfo },
     Loop { body: Vec<BodyElement> },
+    /// Variable definition (from var := or var decl). Used for intra-function
+    /// parameter/variable tracing. Not displayed as a visible row in UI.
+    Def { name: String, rhs: String },
 }
 
 
@@ -112,6 +117,10 @@ struct AnalysisPayload {
     root: FuncKey,
     body: Vec<BodyElement>,
     graph: Vec<(FuncKey, Vec<BodyElement>)>,
+    /// Param names for every function in the graph (for cross-frame tracing).
+    params: Vec<(FuncKey, Vec<String>)>,
+    /// Parameters of the root function (starting point for tracing).
+    root_params: Vec<String>,
 }
 
 fn perform_analysis(file: &Path, line: usize) -> Result<AnalysisPayload, String> {
@@ -124,7 +133,7 @@ fn perform_analysis(file: &Path, line: usize) -> Result<AnalysisPayload, String>
     let (module_root, module_name) = find_go_module(&abs_file)
         .ok_or_else(|| "Could not find go.mod".to_string())?;
 
-    let (graph, defs, interface_index, package_level_vars) = build_call_graph(&module_root, &module_name)
+    let (graph, defs, interface_index, package_level_vars, param_map) = build_call_graph(&module_root, &module_name)
         .map_err(|e| e.to_string())?;
 
     let mut start_callee = resolve_call_at_line(&abs_file, line, &module_root, &module_name, &defs, &interface_index, &mut HashMap::new(), &package_level_vars);
@@ -142,7 +151,9 @@ fn perform_analysis(file: &Path, line: usize) -> Result<AnalysisPayload, String>
         Callee::Local(key) => {
             let body = graph.get(&key).cloned().unwrap_or_default();
             let graph_list: Vec<_> = graph.into_iter().collect();
-            Ok(AnalysisPayload { root: key, body, graph: graph_list })
+            let root_params = param_map.get(&key).cloned().unwrap_or_default();
+            let params_list: Vec<_> = param_map.into_iter().collect();
+            Ok(AnalysisPayload { root: key, body, graph: graph_list, params: params_list, root_params })
         }
         Callee::External(name) | Callee::Stdlib(name) => {
             let fake_key = FuncKey {
@@ -154,6 +165,8 @@ fn perform_analysis(file: &Path, line: usize) -> Result<AnalysisPayload, String>
                 root: fake_key,
                 body: vec![],
                 graph: vec![],
+                params: vec![],
+                root_params: vec![],
             })
         }
         Callee::Interface { pkg, interface, method } => {
@@ -166,6 +179,8 @@ fn perform_analysis(file: &Path, line: usize) -> Result<AnalysisPayload, String>
                 root: fake_key,
                 body: vec![],
                 graph: vec![],
+                params: vec![],
+                root_params: vec![],
             })
         }
     }
@@ -188,7 +203,7 @@ fn run(file: &Path, line: usize) -> Result<(), Box<dyn std::error::Error>> {
     println!("{} {}", color_loc("Module:"), module_name);
     println!("{} {}:{}", color_loc("Analyzing call at"), abs_file.display(), line);
 
-    let (graph, defs, interface_index, package_level_vars) = build_call_graph(&module_root, &module_name)?;
+    let (graph, defs, interface_index, package_level_vars, _param_map) = build_call_graph(&module_root, &module_name)?;
 
     // Locate the starting callee from the call site
     let mut start_callee = resolve_call_at_line(&abs_file, line, &module_root, &module_name, &defs, &interface_index, &mut HashMap::new(), &package_level_vars);
@@ -461,7 +476,8 @@ type DefMap = HashMap<FuncKey, (PathBuf, usize)>;
 
 /// Build the call graph and definition locations.
 /// Two passes over files (very cheap) so we can use full method name info for resolution.
-fn build_call_graph(module_root: &Path, module_name: &str) -> Result<(CallGraph, DefMap, HashMap<String, HashMap<String, HashSet<String>>>, HashMap<String, HashMap<String, String>>), Box<dyn std::error::Error>> {
+/// Also collects parameter names per function for tracing.
+fn build_call_graph(module_root: &Path, module_name: &str) -> Result<(CallGraph, DefMap, HashMap<String, HashMap<String, HashSet<String>>>, HashMap<String, HashMap<String, String>>, HashMap<FuncKey, Vec<String>>), Box<dyn std::error::Error>> {
     let go_files = collect_go_files(module_root);
 
     let mut parser = TsParser::new();
@@ -547,12 +563,15 @@ fn build_call_graph(module_root: &Path, module_name: &str) -> Result<(CallGraph,
         }
     }
 
+    let mut param_map: HashMap<FuncKey, Vec<String>> = HashMap::new();
+
     // === PASS 2: Extract calls in parallel ===
     // Each file's body extraction is independent once indexes are built.
     #[derive(Default)]
     struct FileBodies {
         pkg: String,
         bodies: Vec<(FuncKey, Vec<BodyElement>)>,
+        params: Vec<(FuncKey, Vec<String>)>,
     }
 
     let body_results: Vec<FileBodies> = go_files.par_iter().map(|file_path| {
@@ -575,6 +594,7 @@ fn build_call_graph(module_root: &Path, module_name: &str) -> Result<(CallGraph,
 
         // We need a temporary graph for this file's functions only, then collect.
         let mut file_graph: CallGraph = HashMap::new();
+        let mut file_params: HashMap<FuncKey, Vec<String>> = HashMap::new();
         let root = tree.root_node();
         // First, make sure entries exist for funcs in this file (we can re-extract or use previous).
         // For simplicity, we call populate which inserts into the provided graph.
@@ -589,19 +609,24 @@ fn build_call_graph(module_root: &Path, module_name: &str) -> Result<(CallGraph,
             &interface_index,
             &package_level_vars,
             &mut file_graph,
+            &mut file_params,
         );
 
         for (k, b) in file_graph {
             res.bodies.push((k, b));
         }
+        res.params = file_params.into_iter().collect();
 
         res
     }).collect();
 
-    // Merge bodies
+    // Merge bodies and params
     for r in body_results {
         for (k, b) in r.bodies {
             graph.insert(k, b);
+        }
+        for (k, ps) in r.params {
+            param_map.insert(k, ps);
         }
     }
 
@@ -612,7 +637,7 @@ fn build_call_graph(module_root: &Path, module_name: &str) -> Result<(CallGraph,
         clean_body_elements(body, &defs);
     }
 
-    Ok((graph, defs, interface_index, package_level_vars))
+    Ok((graph, defs, interface_index, package_level_vars, param_map))
 }
 
 struct FuncInfo {
@@ -824,6 +849,7 @@ fn extract_resolved_calls(
                         .map(|c| CallInfo {
                             callee: c,
                             goroutine: now_in_goroutine,
+                            args: vec![],
                         })
                         .collect();
                     out.push((node.start_byte(), infos));
@@ -981,6 +1007,75 @@ fn is_standard_library(import_path: &str) -> bool {
     }
     let first = import_path.split('/').next().unwrap_or(import_path);
     !first.contains('.')
+}
+
+/// Extract raw argument expression texts from a call_expression node.
+fn extract_call_args(call_node: Node, source: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(args_node) = call_node.child_by_field_name("arguments") {
+        let mut cursor = args_node.walk();
+        for child in args_node.children(&mut cursor) {
+            match child.kind() {
+                "," | "(" | ")" => continue,
+                _ => {
+                    let text = child.utf8_text(source.as_bytes()).unwrap_or("").trim().to_string();
+                    if !text.is_empty() {
+                        args.push(text);
+                    }
+                }
+            }
+        }
+    }
+    args
+}
+
+/// Extract formal parameter names (including receiver for methods) from a
+/// function_declaration or method_declaration.
+fn extract_params(node: Node, source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+
+    // Receiver (for methods) — treated as a parameter for tracing (the "self").
+    if node.kind() == "method_declaration" {
+        if let Some(recv_list) = node.child_by_field_name("receiver") {
+            for i in 0..recv_list.child_count() {
+                if let Some(param_decl) = recv_list.child(i) {
+                    if param_decl.kind() == "parameter_declaration" {
+                        for j in 0..param_decl.child_count() {
+                            if let Some(ch) = param_decl.child(j) {
+                                if ch.kind() == "identifier" {
+                                    let nm = ch.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                                    if !nm.is_empty() {
+                                        out.push(nm);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Regular parameters
+    if let Some(params_list) = node.child_by_field_name("parameters") {
+        for i in 0..params_list.child_count() {
+            if let Some(param_decl) = params_list.child(i) {
+                if param_decl.kind() == "parameter_declaration" {
+                    for j in 0..param_decl.child_count() {
+                        if let Some(ch) = param_decl.child(j) {
+                            if ch.kind() == "identifier" {
+                                let nm = ch.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                                if !nm.is_empty() {
+                                    out.push(nm);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Build initial type scope for a function/method from its signature (receiver + parameters).
@@ -1423,6 +1518,7 @@ fn clean_body_elements(elements: &mut [BodyElement], defs: &DefMap) {
             BodyElement::Loop { body } => {
                 clean_body_elements(body, defs);
             }
+            BodyElement::Def { .. } => {}
         }
     }
 }
@@ -1509,10 +1605,12 @@ fn process_node_for_body(
                         scope,
                         package_level_vars,
                     );
+                    let args = extract_call_args(call, source);
                     for cal in cals {
                         elems.push(BodyElement::Call { info: CallInfo {
                             callee: cal,
                             goroutine: true,
+                            args: args.clone(),
                         }});
                     }
                 }
@@ -1531,10 +1629,12 @@ fn process_node_for_body(
                     scope,
                     package_level_vars,
                 );
+                let args = extract_call_args(node, source);
                 for cal in cals {
                     elems.push(BodyElement::Call { info: CallInfo {
                         callee: cal,
                         goroutine: false,
+                        args: args.clone(),
                     }});
                 }
             }
@@ -1544,6 +1644,32 @@ fn process_node_for_body(
             for ch in node.children(&mut cc) {
                 if ch.kind() == "var_spec" {
                     update_scope_from_var_spec(ch, source, current_pkg, imports, scope);
+                    // Also emit Def (rhs may be empty if only type given)
+                    // Try to find a rhs expression for tracing
+                    let mut names: Vec<String> = vec![];
+                    let mut rhs_text = String::new();
+                    let mut inner = ch.walk();
+                    for cch in ch.children(&mut inner) {
+                        if cch.kind() == "identifier" {
+                            names.push(cch.utf8_text(source.as_bytes()).unwrap_or("").to_string());
+                        }
+                    }
+                    // look for possible value expr after =
+                    let mut vc = ch.walk();
+                    for cch in ch.children(&mut vc) {
+                        if matches!(cch.kind(), "composite_literal" | "call_expression" | "unary_expression" | "identifier" | "selector_expression") {
+                            let t = cch.utf8_text(source.as_bytes()).unwrap_or("").trim().to_string();
+                            if !t.is_empty() && !names.contains(&t) {
+                                rhs_text = t;
+                                break;
+                            }
+                        }
+                    }
+                    for nm in names {
+                        if !nm.is_empty() {
+                            elems.push(BodyElement::Def { name: nm, rhs: rhs_text.clone() });
+                        }
+                    }
                 }
             }
             // Recurse to find calls inside the declaration expressions
@@ -1565,6 +1691,39 @@ fn process_node_for_body(
         }
         "short_var_declaration" => {
             collect_var_types_from_short_decl(node, source, current_pkg, imports, scope);
+
+            // Emit Def for tracing (variables created and potentially passed down)
+            let mut lhs_names: Vec<String> = Vec::new();
+            let mut rhs_exprs: Vec<Node> = Vec::new();
+            let mut cc = node.walk();
+            let mut saw_lists = 0usize;
+            for ch in node.children(&mut cc) {
+                if ch.kind() == "expression_list" {
+                    if saw_lists == 0 {
+                        let mut lc = ch.walk();
+                        for idch in ch.children(&mut lc) {
+                            if idch.kind() == "identifier" {
+                                lhs_names.push(idch.utf8_text(source.as_bytes()).unwrap_or("").to_string());
+                            }
+                        }
+                    } else if saw_lists == 1 {
+                        let mut rc = ch.walk();
+                        for exch in ch.children(&mut rc) {
+                            rhs_exprs.push(exch);
+                        }
+                    }
+                    saw_lists += 1;
+                }
+            }
+            for (i, nm) in lhs_names.into_iter().enumerate() {
+                if !nm.is_empty() {
+                    let rhs = rhs_exprs.get(i)
+                        .map(|e| e.utf8_text(source.as_bytes()).unwrap_or("").trim().to_string())
+                        .unwrap_or_default();
+                    elems.push(BodyElement::Def { name: nm, rhs });
+                }
+            }
+
             // Recurse for any calls inside the RHS expressions
             let mut c = node.walk();
             for ch in node.children(&mut c) {
@@ -1627,6 +1786,7 @@ fn populate_body_elements(
     interface_index: &HashMap<String, HashMap<String, HashSet<String>>>,
     package_level_vars: &HashMap<String, HashMap<String, String>>,
     graph: &mut CallGraph,
+    params: &mut HashMap<FuncKey, Vec<String>>,
 ) {
     match node.kind() {
         "function_declaration" | "method_declaration" => {
@@ -1659,7 +1819,9 @@ fn populate_body_elements(
                         package_level_vars,
                     );
                     // Overwrite the (empty) entry from pass 1 with the structured body
-                    graph.insert(key, elems);
+                    graph.insert(key.clone(), elems);
+                    let pnames = extract_params(node, source);
+                    params.insert(key, pnames);
                 }
             }
         }
@@ -1679,6 +1841,7 @@ fn populate_body_elements(
             interface_index,
             package_level_vars,
             graph,
+            params,
         );
     }
 }
@@ -1941,6 +2104,7 @@ fn has_printable_content(elements: &[BodyElement]) -> bool {
                     return true;
                 }
             }
+            BodyElement::Def { .. } => {} // internal for tracing, not printed
         }
     }
     false
@@ -1963,11 +2127,13 @@ fn print_body_elements(
     max_depth: usize,
 ) {
     // Filter to only loops that contain printable content (calls) and all calls.
+    // Defs are for tracing only and are filtered out of the visible tree.
     let printable: Vec<&BodyElement> = elements
         .iter()
         .filter(|e| match e {
             BodyElement::Call { .. } => true,
             BodyElement::Loop { body } => has_printable_content(body),
+            BodyElement::Def { .. } => false,
         })
         .collect();
 
@@ -1979,6 +2145,7 @@ fn print_body_elements(
 
         let elem = *elem;
         match elem {
+            BodyElement::Def { .. } => {} // should have been filtered
             BodyElement::Call { info } => {
                 match &info.callee {
                     Callee::Local(child_key) => {

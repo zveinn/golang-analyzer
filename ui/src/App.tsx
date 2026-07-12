@@ -15,18 +15,23 @@ type Callee =
 interface CallInfo {
   callee: Callee
   goroutine: boolean
+  args?: string[]
 }
 
 interface BodyElement {
-  kind: 'Call' | 'Loop'
+  kind: 'Call' | 'Loop' | 'Def'
   info?: CallInfo
   body?: BodyElement[]
+  name?: string
+  rhs?: string
 }
 
 interface AnalysisPayload {
   root: FuncKey
   body: BodyElement[]
   graph: Array<[FuncKey, BodyElement[]]>
+  params?: Array<[FuncKey, string[]]>
+  root_params?: string[]
 }
 
 type ConnState = 'connecting' | 'open' | 'closed'
@@ -65,6 +70,113 @@ function splitQualified(kind: CalleeKind, raw: string): CalleeParts {
   return { kind, pkg: null, recv: null, label: raw, key: null }
 }
 
+/** Extract a bare identifier from an expression text (for tracing). */
+function getBareId(expr: string | undefined): string | null {
+  if (!expr) return null
+  const t = expr.trim()
+  if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(t)) return t
+  return null
+}
+
+/** Simple check if an expression text mentions any of the currently traced names. */
+function exprMentionsTraced(expr: string | undefined, traced: string[]): boolean {
+  if (!expr || traced.length === 0) return false
+  const t = expr.trim()
+  return traced.some((nm) => nm && (t === nm || (nm.length > 1 && t.includes(nm))))
+}
+
+/* ------------------------------------------------------------------ */
+/*  BodySequence: renders a list of BodyElements while simulating     */
+/*  traced variable flow for the current frame.                       */
+/* ------------------------------------------------------------------ */
+
+function BodySequence({
+  elems,
+  graphMap,
+  paramsMap,
+  depth,
+  basePath,
+  expanded,
+  toggle,
+  stack,
+  initialTraced,
+}: {
+  elems: BodyElement[]
+  graphMap: Map<string, BodyElement[]>
+  paramsMap: Map<string, string[]>
+  depth: number
+  basePath: string
+  expanded: Set<string>
+  toggle: (path: string) => void
+  stack: Set<string>
+  initialTraced: string[]
+}) {
+  const nodes: React.ReactNode[] = []
+  const live = new Set<string>(initialTraced || [])
+
+  elems.forEach((elem, i) => {
+    const path = `${basePath}/${i}`
+
+    if (elem.kind === 'Def') {
+      // Propagate trace: if the rhs mentions a live traced name, the lhs becomes traced in this frame.
+      const rhs = elem.rhs || ''
+      if (elem.name && exprMentionsTraced(rhs, Array.from(live))) {
+        live.add(elem.name)
+      }
+      // Defs are not rendered visibly (they exist only to drive tracing).
+      return
+    }
+
+    if (elem.kind === 'Loop') {
+      nodes.push(
+        <TreeNode
+          key={i}
+          elem={elem}
+          graphMap={graphMap}
+          paramsMap={paramsMap}
+          depth={depth}
+          path={path}
+          expanded={expanded}
+          toggle={toggle}
+          stack={stack}
+          traced={Array.from(live)}
+        />
+      )
+      return
+    }
+
+    if (elem.kind === 'Call' && elem.info) {
+      // Which current live names flow into this call?
+      const argList = elem.info.args || []
+      const carriesHere = Array.from(live).filter((nm) =>
+        argList.some((a) => {
+          const bid = getBareId(a)
+          return bid === nm || exprMentionsTraced(a, [nm])
+        })
+      )
+
+      nodes.push(
+        <TreeNode
+          key={i}
+          elem={elem}
+          graphMap={graphMap}
+          paramsMap={paramsMap}
+          depth={depth}
+          path={path}
+          expanded={expanded}
+          toggle={toggle}
+          stack={stack}
+          traced={Array.from(live)}
+          carries={carriesHere}
+        />
+      )
+      return
+    }
+  })
+
+  return <>{nodes}</>
+}
+
 /* ------------------------------------------------------------------ */
 /*  Tree node                                                          */
 /* ------------------------------------------------------------------ */
@@ -72,19 +184,25 @@ function splitQualified(kind: CalleeKind, raw: string): CalleeParts {
 function TreeNode({
   elem,
   graphMap,
+  paramsMap,
   depth,
   path,
   expanded,
   toggle,
   stack,
+  traced,
+  carries,
 }: {
   elem: BodyElement
   graphMap: Map<string, BodyElement[]>
+  paramsMap: Map<string, string[]>
   depth: number
   path: string
   expanded: Set<string>
   toggle: (path: string) => void
   stack: Set<string>
+  traced?: string[]
+  carries?: string[]
 }) {
   const open = expanded.has(path)
 
@@ -106,18 +224,17 @@ function TreeNode({
         </div>
         {open && (
           <div className="children">
-            {children.map((child, i) => (
-              <TreeNode
-                key={i}
-                elem={child}
-                graphMap={graphMap}
-                depth={depth + 1}
-                path={`${path}/${i}`}
-                expanded={expanded}
-                toggle={toggle}
-                stack={stack}
-              />
-            ))}
+            <BodySequence
+              elems={children}
+              graphMap={graphMap}
+              paramsMap={paramsMap}
+              depth={depth + 1}
+              basePath={path}
+              expanded={expanded}
+              toggle={toggle}
+              stack={stack}
+              initialTraced={traced || []}
+            />
           </div>
         )}
       </div>
@@ -134,6 +251,35 @@ function TreeNode({
     const isRecursive = keyStr ? stack.has(keyStr) : false
     const expandable = !!subBody && subBody.length > 0 && !isRecursive
     const nextStack = keyStr ? new Set(stack).add(keyStr) : stack
+
+    // Compute which of our current traced names flow into this call's args
+    const argList = info.args || []
+    const localCarries = carries || []
+    // If parent passed carries, or compute from traced prop
+    const effectiveCarries = localCarries.length
+      ? localCarries
+      : (traced || []).filter((t) =>
+          argList.some((a) => {
+            const b = (a || '').trim()
+            return b === t || (t.length > 1 && b.includes(t))
+          })
+        )
+
+    const showTracedBadge = kind !== 'stdlib' && effectiveCarries.length > 0
+
+    // When expanding into sub-function, map the traced values by arg position to child's formal params
+    let childInitialTraced: string[] | undefined
+    if (keyStr && subBody) {
+      const childFormals = paramsMap.get(keyStr) || []
+      const mapped: string[] = []
+      for (let i = 0; i < argList.length; i++) {
+        const bid = getBareId(argList[i])
+        if (bid && (traced || []).includes(bid) && childFormals[i]) {
+          mapped.push(childFormals[i])
+        }
+      }
+      if (mapped.length > 0) childInitialTraced = mapped
+    }
 
     return (
       <div className="tree-branch">
@@ -156,24 +302,28 @@ function TreeNode({
             {info.goroutine && <span className="badge badge-goroutine">goroutine</span>}
             {kind === 'external' && <span className="badge badge-external">external</span>}
             {kind === 'stdlib' && <span className="badge badge-stdlib">stdlib</span>}
+            {showTracedBadge && (
+              <span className="badge badge-traced" title={`Traced from: ${effectiveCarries.join(', ')}`}>
+                traced:{effectiveCarries.join(',')}
+              </span>
+            )}
             {isRecursive && <span className="badge badge-recursive">recursive ↺</span>}
           </span>
           {expandable && <span className="row-count">{subBody!.length}</span>}
         </div>
         {open && expandable && (
           <div className="children">
-            {subBody!.map((child, i) => (
-              <TreeNode
-                key={i}
-                elem={child}
-                graphMap={graphMap}
-                depth={depth + 1}
-                path={`${path}/${i}`}
-                expanded={expanded}
-                toggle={toggle}
-                stack={nextStack}
-              />
-            ))}
+            <BodySequence
+              elems={subBody!}
+              graphMap={graphMap}
+              paramsMap={paramsMap}
+              depth={depth + 1}
+              basePath={path}
+              expanded={expanded}
+              toggle={toggle}
+              stack={nextStack}
+              initialTraced={childInitialTraced || []}
+            />
           </div>
         )}
       </div>
@@ -243,6 +393,9 @@ function collectAllPaths(
   return out
 }
 
+// Also update stats scan to ignore Defs (already mostly does via info check)
+
+
 interface Stats {
   functions: number
   calls: number
@@ -307,6 +460,14 @@ function App() {
     data?.graph.forEach(([key, body]) => m.set(JSON.stringify(key), body))
     return m
   }, [data])
+
+  const paramsMap = useMemo(() => {
+    const m = new Map<string, string[]>()
+    data?.params?.forEach(([key, ps]) => m.set(JSON.stringify(key), ps || []))
+    return m
+  }, [data])
+
+  const rootParams = data?.root_params || []
 
   const stats = useMemo(() => (data ? computeStats(data) : null), [data])
 
@@ -384,22 +545,26 @@ function App() {
               <span className="kind-dot kind-local" />
               <span className="tree-root-fn">{formatFuncKey(data.root)}</span>
               <span className="tree-root-tag">root</span>
+              {rootParams.length > 0 && (
+                <span className="root-params" title="Parameters traced through the execution">
+                  params: {rootParams.join(', ')}
+                </span>
+              )}
             </div>
             {data.body.length === 0 && (
               <div className="tree-empty">This function makes no tracked calls.</div>
             )}
-            {data.body.map((elem, idx) => (
-              <TreeNode
-                key={idx}
-                elem={elem}
-                graphMap={graphMap}
-                depth={0}
-                path={`r/${idx}`}
-                expanded={expanded}
-                toggle={toggle}
-                stack={new Set()}
-              />
-            ))}
+            <BodySequence
+              elems={data.body}
+              graphMap={graphMap}
+              paramsMap={paramsMap}
+              depth={0}
+              basePath="r"
+              expanded={expanded}
+              toggle={toggle}
+              stack={new Set()}
+              initialTraced={rootParams}
+            />
           </div>
         ) : (
           <div className="empty-state">
