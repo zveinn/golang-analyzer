@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::Arc;
+use rayon::prelude::*;
 use walkdir::WalkDir;
 use tree_sitter::{Parser as TsParser, Node, Tree};
 
@@ -41,6 +42,12 @@ enum Callee {
     Local(FuncKey),
     External(String),
     Stdlib(String),
+    /// Call through an interface (the "exact interface" the user asked for)
+    Interface {
+        pkg: String,
+        interface: String,
+        method: String,
+    },
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -117,10 +124,10 @@ fn perform_analysis(file: &Path, line: usize) -> Result<AnalysisPayload, String>
     let (module_root, module_name) = find_go_module(&abs_file)
         .ok_or_else(|| "Could not find go.mod".to_string())?;
 
-    let (graph, defs) = build_call_graph(&module_root, &module_name)
+    let (graph, defs, interface_index, package_level_vars) = build_call_graph(&module_root, &module_name)
         .map_err(|e| e.to_string())?;
 
-    let mut start_callee = resolve_call_at_line(&abs_file, line, &module_root, &module_name, &defs);
+    let mut start_callee = resolve_call_at_line(&abs_file, line, &module_root, &module_name, &defs, &interface_index, &mut HashMap::new(), &package_level_vars);
 
     if start_callee.is_none() {
         // Fallback: if the line is inside a known local function, analyze from that function definition.
@@ -149,6 +156,18 @@ fn perform_analysis(file: &Path, line: usize) -> Result<AnalysisPayload, String>
                 graph: vec![],
             })
         }
+        Callee::Interface { pkg, interface, method } => {
+            let fake_key = FuncKey {
+                pkg: Arc::from(format!("{}.{}", pkg, interface).as_str()),
+                recv: None,
+                name: Arc::from(method.as_str()),
+            };
+            Ok(AnalysisPayload {
+                root: fake_key,
+                body: vec![],
+                graph: vec![],
+            })
+        }
     }
 }
 
@@ -169,10 +188,10 @@ fn run(file: &Path, line: usize) -> Result<(), Box<dyn std::error::Error>> {
     println!("{} {}", color_loc("Module:"), module_name);
     println!("{} {}:{}", color_loc("Analyzing call at"), abs_file.display(), line);
 
-    let (graph, defs) = build_call_graph(&module_root, &module_name)?;
+    let (graph, defs, interface_index, package_level_vars) = build_call_graph(&module_root, &module_name)?;
 
     // Locate the starting callee from the call site
-    let mut start_callee = resolve_call_at_line(&abs_file, line, &module_root, &module_name, &defs);
+    let mut start_callee = resolve_call_at_line(&abs_file, line, &module_root, &module_name, &defs, &interface_index, &mut HashMap::new(), &package_level_vars);
 
     if start_callee.is_none() {
         // Fallback: if the line is inside a known local function, analyze from that function definition.
@@ -202,6 +221,10 @@ fn run(file: &Path, line: usize) -> Result<(), Box<dyn std::error::Error>> {
         Callee::Stdlib(name) => {
             println!("\n{}", paint("Call at given location is to the standard library (not following):", "1"));
             println!("  {}", color_external(&format!("[stdlib] {}", name)));  // label it clearly
+        }
+        Callee::Interface { pkg, interface, method } => {
+            println!("\n{}", paint("Call at given location is to interface method (not following concrete impls):", "1"));
+            println!("  [interface] {}.{}.{}", pkg, interface, method);
         }
     }
 
@@ -438,7 +461,7 @@ type DefMap = HashMap<FuncKey, (PathBuf, usize)>;
 
 /// Build the call graph and definition locations.
 /// Two passes over files (very cheap) so we can use full method name info for resolution.
-fn build_call_graph(module_root: &Path, module_name: &str) -> Result<(CallGraph, DefMap), Box<dyn std::error::Error>> {
+fn build_call_graph(module_root: &Path, module_name: &str) -> Result<(CallGraph, DefMap, HashMap<String, HashMap<String, HashSet<String>>>, HashMap<String, HashMap<String, String>>), Box<dyn std::error::Error>> {
     let go_files = collect_go_files(module_root);
 
     let mut parser = TsParser::new();
@@ -448,70 +471,138 @@ fn build_call_graph(module_root: &Path, module_name: &str) -> Result<(CallGraph,
     let mut graph: CallGraph = HashMap::new();
     let mut defs: DefMap = HashMap::new();
     let mut method_index: HashMap<String, Vec<FuncKey>> = HashMap::new();
+    // pkg -> interface_name -> set of method names it declares
+    let mut interface_index: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
+    let mut package_level_vars: HashMap<String, HashMap<String, String>> = HashMap::new(); // pkg -> varname -> type
 
-    // === PASS 1: Collect all definitions and method names (memory efficient - one file at a time) ===
-    for file_path in &go_files {
+    // === PASS 1: Collect all definitions and method names in parallel ===
+    // Parsing and tree walking are CPU-bound, so we parallelize with rayon.
+    // We collect results then merge (merge is fast and avoids locks during parse).
+    #[derive(Default)]
+    struct FileDefs {
+        pkg: String,
+        func_infos: Vec<FuncInfo>,
+        ifaces: HashMap<String, HashSet<String>>,
+        method_defs: Vec<FuncKey>, // only those with recv for method_index
+        imports: HashMap<String, String>,
+        typed_vars: HashMap<String, String>, // top level var name -> type
+    }
+
+    let def_results: Vec<FileDefs> = go_files.par_iter().map(|file_path| {
+        let mut res = FileDefs::default();
         let source = match fs::read_to_string(file_path) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(_) => return res,
         };
-        if source.trim().is_empty() { continue; }
+        if source.trim().is_empty() { return res; }
 
-        let tree = match parser.parse(source.as_bytes(), None) {
+        let mut p = TsParser::new();
+        p.set_language(&tree_sitter_go::language()).expect("parser");
+        let tree = match p.parse(source.as_bytes(), None) {
             Some(t) => t,
-            None => continue,
+            None => return res,
         };
 
-        let pkg = compute_pkg_path(file_path, module_root, module_name);
-        let func_infos = extract_function_infos(&tree, &source, &pkg, file_path);
+        res.pkg = compute_pkg_path(file_path, module_root, module_name);
+        res.func_infos = extract_function_infos(&tree, &source, &res.pkg, file_path);
+        res.ifaces = extract_interfaces(&tree, &source, &res.pkg);
+        res.imports = extract_imports(&tree, &source);
 
-        for info in &func_infos {
-            defs.entry(info.key.clone()).or_insert((info.file.clone(), info.line));
-            graph.entry(info.key.clone()).or_insert_with(Vec::new);
-
+        for info in &res.func_infos {
             if info.key.recv.is_some() {
-                method_index
-                    .entry(info.key.name.to_string())
-                    .or_default()
-                    .push(info.key.clone());
+                res.method_defs.push(info.key.clone());
             }
         }
 
-        drop(tree);
-        drop(source);
+        // Extract top level typed vars for globals
+        res.typed_vars = extract_top_level_typed_vars(&tree, &source, &res.pkg, &res.imports);
+
+        // Note: we don't drop explicitly; they go out of scope.
+        res
+    }).collect();
+
+    // Merge results sequentially
+    for r in def_results {
+        for info in r.func_infos {
+            defs.entry(info.key.clone()).or_insert((info.file.clone(), info.line));
+            graph.entry(info.key.clone()).or_insert_with(Vec::new);
+        }
+        for (iface, methods) in r.ifaces {
+            interface_index
+                .entry(r.pkg.clone())
+                .or_default()
+                .insert(iface, methods);
+        }
+        for (var, typ) in r.typed_vars {
+            package_level_vars
+                .entry(r.pkg.clone())
+                .or_default()
+                .insert(var, typ);
+        }
+        for k in r.method_defs {
+            method_index
+                .entry(k.name.to_string())
+                .or_default()
+                .push(k);
+        }
     }
 
-    // === PASS 2: Extract calls, using method_index for better resolution of methods ===
-    for file_path in &go_files {
+    // === PASS 2: Extract calls in parallel ===
+    // Each file's body extraction is independent once indexes are built.
+    #[derive(Default)]
+    struct FileBodies {
+        pkg: String,
+        bodies: Vec<(FuncKey, Vec<BodyElement>)>,
+    }
+
+    let body_results: Vec<FileBodies> = go_files.par_iter().map(|file_path| {
+        let mut res = FileBodies::default();
         let source = match fs::read_to_string(file_path) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(_) => return res,
         };
-        if source.trim().is_empty() { continue; }
+        if source.trim().is_empty() { return res; }
 
-        let tree = match parser.parse(source.as_bytes(), None) {
+        let mut p = TsParser::new();
+        p.set_language(&tree_sitter_go::language()).expect("parser");
+        let tree = match p.parse(source.as_bytes(), None) {
             Some(t) => t,
-            None => continue,
+            None => return res,
         };
 
-        let pkg = compute_pkg_path(file_path, module_root, module_name);
+        res.pkg = compute_pkg_path(file_path, module_root, module_name);
         let imports = extract_imports(&tree, &source);
 
-        // Structured extraction: visit the tree, and for each function/method declaration
-        // extract its body as nested elements (loops contain their calls).
+        // We need a temporary graph for this file's functions only, then collect.
+        let mut file_graph: CallGraph = HashMap::new();
         let root = tree.root_node();
+        // First, make sure entries exist for funcs in this file (we can re-extract or use previous).
+        // For simplicity, we call populate which inserts into the provided graph.
+        // To avoid global mutation, we use a per-file graph here.
         populate_body_elements(
             root,
             &source,
-            &pkg,
+            &res.pkg,
             &imports,
             module_name,
             &method_index,
-            &mut graph,
+            &interface_index,
+            &package_level_vars,
+            &mut file_graph,
         );
 
-        drop(tree);
-        drop(source);
+        for (k, b) in file_graph {
+            res.bodies.push((k, b));
+        }
+
+        res
+    }).collect();
+
+    // Merge bodies
+    for r in body_results {
+        for (k, b) in r.bodies {
+            graph.insert(k, b);
+        }
     }
 
     // Post-process:
@@ -521,7 +612,7 @@ fn build_call_graph(module_root: &Path, module_name: &str) -> Result<(CallGraph,
         clean_body_elements(body, &defs);
     }
 
-    Ok((graph, defs))
+    Ok((graph, defs, interface_index, package_level_vars))
 }
 
 struct FuncInfo {
@@ -726,7 +817,7 @@ fn extract_resolved_calls(
 
         if node.kind() == "call_expression" {
             if let Some(func_node) = node.child_by_field_name("function") {
-                let callees = resolve_callee_node(func_node, source, current_pkg, imports, module_name, method_index);
+                let callees = resolve_callee_node(func_node, source, current_pkg, imports, module_name, method_index, &HashMap::new(), &mut HashMap::new(), &HashMap::new());
                 if !callees.is_empty() {
                     let infos: Vec<CallInfo> = callees
                         .into_iter()
@@ -759,6 +850,9 @@ fn resolve_callee_node(
     imports: &HashMap<String, String>,
     module_name: &str,
     method_index: &HashMap<String, Vec<FuncKey>>,
+    interface_index: &HashMap<String, HashMap<String, HashSet<String>>>,
+    scope: &HashMap<String, String>,
+    package_level_vars: &HashMap<String, HashMap<String, String>>,
 ) -> Vec<Callee> {
     match func_node.kind() {
         "identifier" => {
@@ -817,20 +911,41 @@ fn resolve_callee_node(
             }
 
             // Method call on a value (e.g. c.Method() or obj.Field()).
-            // Prefer local methods resolved by name. Only fall back to a descriptive
-            // External/Stdlib label if we couldn't match any local method definition.
-            // This prevents internal struct methods (like c.NewSessionForCommand on *CMD)
-            // from being mislabeled as [external].
+            // Use scope to find the static type of the operand (receiver).
             let mut out = vec![];
 
-            if let Some(cands) = method_index.get(&called_name) {
-                for c in cands {
-                    out.push(Callee::Local(c.clone()));
+            let receiver_type = scope.get(&operand_text).cloned().or_else(|| {
+                package_level_vars.get(current_pkg).and_then(|m| m.get(&operand_text)).cloned()
+            });
+
+            if let Some(typ) = &receiver_type {
+                let normalized = normalize_type(typ.clone(), imports, current_pkg);
+
+                // 1. Check if it matches a known interface
+                if let Some((iface_pkg, iface_name)) = find_interface_for_type(&normalized, interface_index) {
+                    if let Some(ifaces) = interface_index.get(&iface_pkg) {
+                        if let Some(methods) = ifaces.get(&iface_name) {
+                            if methods.contains(&called_name) {
+                                return vec![Callee::Interface {
+                                    pkg: iface_pkg,
+                                    interface: iface_name,
+                                    method: called_name,
+                                }];
+                            }
+                        }
+                    }
+                }
+
+                // 2. Try to find exact concrete method for this receiver type
+                if let Some(exact) = find_exact_method(method_index, &normalized, &called_name) {
+                    return vec![Callee::Local(exact)];
                 }
             }
 
+            // If we reach here without a known receiver type, do not explode into
+            // all name-matching methods or every iface sharing the method name.
+            // Report as a descriptive external call instead.
             if out.is_empty() {
-                // No local methods found for this name → use descriptive form
                 let raw = format!("{}.{}", operand_text, called_name);
                 if let Some(full_import) = imports.get(&operand_text) {
                     if is_standard_library(full_import) {
@@ -848,7 +963,7 @@ fn resolve_callee_node(
         }
         "parenthesized_expression" => {
             if let Some(inner) = func_node.child(0) {
-                return resolve_callee_node(inner, source, current_pkg, imports, module_name, method_index);
+                return resolve_callee_node(inner, source, current_pkg, imports, module_name, method_index, interface_index, scope, package_level_vars);
             }
             vec![]
         }
@@ -866,6 +981,349 @@ fn is_standard_library(import_path: &str) -> bool {
     }
     let first = import_path.split('/').next().unwrap_or(import_path);
     !first.contains('.')
+}
+
+/// Build initial type scope for a function/method from its signature (receiver + parameters).
+fn build_signature_scope(node: Node, source: &str, imports: &HashMap<String, String>, current_pkg: &str) -> HashMap<String, String> {
+    let mut scope: HashMap<String, String> = HashMap::new();
+
+    // Receiver for methods
+    if node.kind() == "method_declaration" {
+        if let Some(recv_list) = node.child_by_field_name("receiver") {
+            for i in 0..recv_list.child_count() {
+                if let Some(param_decl) = recv_list.child(i) {
+                    if param_decl.kind() == "parameter_declaration" {
+                        let mut var_name = String::new();
+                        let mut typ = String::new();
+                        for j in 0..param_decl.child_count() {
+                            if let Some(ch) = param_decl.child(j) {
+                                match ch.kind() {
+                                    "identifier" => var_name = ch.utf8_text(source.as_bytes()).unwrap_or("").to_string(),
+                                    "pointer_type" | "type_identifier" | "qualified_type" => {
+                                        typ = ch.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if !var_name.is_empty() && !typ.is_empty() {
+                            scope.insert(var_name, normalize_type(typ, imports, current_pkg));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Parameters
+    if let Some(params_list) = node.child_by_field_name("parameters") {
+        for i in 0..params_list.child_count() {
+            if let Some(param_decl) = params_list.child(i) {
+                if param_decl.kind() == "parameter_declaration" {
+                    let mut var_names = vec![];
+                    let mut typ = String::new();
+                    for j in 0..param_decl.child_count() {
+                        if let Some(ch) = param_decl.child(j) {
+                            match ch.kind() {
+                                "identifier" => var_names.push(ch.utf8_text(source.as_bytes()).unwrap_or("").to_string()),
+                                "pointer_type" | "type_identifier" | "qualified_type" | "array_type" | "map_type" | "chan_type" => {
+                                    typ = ch.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    let norm_typ = if !typ.is_empty() {
+                        normalize_type(typ, imports, current_pkg)
+                    } else {
+                        String::new()
+                    };
+                    for vname in var_names {
+                        if !vname.is_empty() && !norm_typ.is_empty() {
+                            scope.insert(vname, norm_typ.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    scope
+}
+
+fn normalize_type(typ: String, imports: &HashMap<String, String>, current_pkg: &str) -> String {
+    let t = typ.trim().trim_start_matches('*').to_string();
+    if t.contains('.') {
+        return t;
+    }
+    if let Some(full) = imports.get(&t) {
+        return full.clone();
+    }
+    if t == "error" || t == "string" || t == "int" || t == "bool" { // builtins
+        return t;
+    }
+    format!("{}.{}", current_pkg, t)
+}
+
+/// Best-effort inference of a raw receiver type string (e.g. "*Foo", "Bar", "pkg.Qux")
+/// from a RHS expression in a short declaration or var initializer.
+fn infer_raw_type_from_rhs(expr: Node, source: &str) -> Option<String> {
+    let txt = expr.utf8_text(source.as_bytes()).unwrap_or("").trim().to_string();
+    if txt.is_empty() {
+        return None;
+    }
+    match expr.kind() {
+        "composite_literal" => {
+            // type is usually the first child (type_identifier, qualified_type, etc.)
+            if let Some(first) = expr.child(0) {
+                let k = first.kind();
+                if k == "type_identifier" || k == "qualified_type" || k.ends_with("type") || k == "pointer_type" || k == "identifier" {
+                    let t = first.utf8_text(source.as_bytes()).unwrap_or("").trim().to_string();
+                    if !t.is_empty() {
+                        return Some(t);
+                    }
+                }
+            }
+            // fallback: before '{' 
+            if let Some(pos) = txt.find('{') {
+                let t = txt[..pos].trim().to_string();
+                if !t.is_empty() {
+                    return Some(t);
+                }
+            }
+            None
+        }
+        "unary_expression" => {
+            if txt.starts_with('&') {
+                let rest = txt[1..].trim_start().to_string();
+                if let Some(pos) = rest.find('{') {
+                    let base = rest[..pos].trim().to_string();
+                    if !base.is_empty() {
+                        return Some(if base.starts_with('*') { base } else { format!("*{}", base) });
+                    }
+                } else if !rest.is_empty() {
+                    // &TypeName or &var but we take if looks like exported ident
+                    let base = rest.trim().to_string();
+                    if base.chars().next().map_or(false, |c| c.is_ascii_uppercase()) || base.starts_with('*') {
+                        return Some(if base.starts_with('*') { base } else { format!("*{}", base) });
+                    }
+                }
+            }
+            None
+        }
+        "call_expression" => {
+            if let Some(fnode) = expr.child_by_field_name("function") {
+                let fname = fnode.utf8_text(source.as_bytes()).unwrap_or("");
+                // NewFoo() or newFoo() -> *Foo
+                if let Some(stripped) = fname.strip_prefix("New").or_else(|| fname.strip_prefix("new")) {
+                    if !stripped.is_empty() && stripped.chars().next().map_or(false, |c| c.is_ascii_uppercase() || stripped.chars().next().map_or(false, |c| c.is_ascii_lowercase())) {
+                        return Some(format!("*{}", stripped));
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn collect_var_types_from_short_decl(
+    node: Node,
+    source: &str,
+    current_pkg: &str,
+    imports: &HashMap<String, String>,
+    scope: &mut HashMap<String, String>,
+) {
+    // short_var_declaration contains two expression_list: lhs then rhs
+    let mut expr_lists: Vec<Node> = Vec::new();
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        if ch.kind() == "expression_list" {
+            expr_lists.push(ch);
+        }
+    }
+    if expr_lists.len() < 2 {
+        return;
+    }
+    let lhs = expr_lists[0];
+    let rhs = expr_lists[1];
+
+    let mut lhs_names: Vec<String> = Vec::new();
+    let mut lc = lhs.walk();
+    for ch in lhs.children(&mut lc) {
+        if ch.kind() == "identifier" {
+            lhs_names.push(ch.utf8_text(source.as_bytes()).unwrap_or("").to_string());
+        }
+    }
+
+    let mut rhs_exprs: Vec<Node> = Vec::new();
+    let mut rc = rhs.walk();
+    for ch in rhs.children(&mut rc) {
+        rhs_exprs.push(ch);
+    }
+
+    for (i, name) in lhs_names.into_iter().enumerate() {
+        if name.is_empty() {
+            continue;
+        }
+        let typ_raw = rhs_exprs.get(i).and_then(|re| infer_raw_type_from_rhs(*re, source));
+        if let Some(t) = typ_raw {
+            let norm = normalize_type(t, imports, current_pkg);
+            if !norm.is_empty() {
+                scope.insert(name, norm);
+            }
+        }
+    }
+}
+
+fn update_scope_from_var_spec(
+    spec: Node,
+    source: &str,
+    current_pkg: &str,
+    imports: &HashMap<String, String>,
+    scope: &mut HashMap<String, String>,
+) {
+    let mut names = vec![];
+    let mut typ = String::new();
+    let mut ccc = spec.walk();
+    for cch in spec.children(&mut ccc) {
+        match cch.kind() {
+            "identifier" => names.push(cch.utf8_text(source.as_bytes()).unwrap_or("").to_string()),
+            "pointer_type" | "type_identifier" | "qualified_type" => {
+                typ = cch.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+            }
+            _ => {}
+        }
+    }
+    if typ.is_empty() {
+        // try infer from value expr if present (var x = NewY() etc)
+        let mut vc = spec.walk();
+        for cch in spec.children(&mut vc) {
+            if matches!(cch.kind(), "expression_list" | "composite_literal" | "call_expression" | "unary_expression" | "identifier") {
+                if let Some(inf) = infer_raw_type_from_rhs(cch, source) {
+                    typ = inf;
+                    break;
+                }
+            }
+        }
+    }
+    for n in names {
+        if !n.is_empty() && !typ.is_empty() {
+            scope.insert(n, normalize_type(typ.clone(), imports, current_pkg));
+        }
+    }
+}
+
+fn extract_top_level_typed_vars(tree: &Tree, source: &str, pkg: &str, imports: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut vars: HashMap<String, String> = HashMap::new();
+    let root = tree.root_node();
+
+    fn visit(node: Node, source: &str, pkg: &str, imports: &HashMap<String, String>, vars: &mut HashMap<String, String>) {
+        if node.kind() == "var_declaration" {
+            let mut cc = node.walk();
+            for ch in node.children(&mut cc) {
+                if ch.kind() == "var_spec" {
+                    update_scope_from_var_spec(ch, source, pkg, imports, vars);
+                }
+            }
+        }
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            visit(ch, source, pkg, imports, vars);
+        }
+    }
+
+    visit(root, source, pkg, imports, &mut vars);
+    vars
+}
+
+/// Try to find if a type corresponds to a known interface.
+fn find_interface_for_type(typ: &str, interface_index: &HashMap<String, HashMap<String, HashSet<String>>>) -> Option<(String, String)> {
+    let clean = typ.trim_start_matches('*');
+    if let Some(dot_pos) = clean.rfind('.') {
+        let pkg_part = &clean[..dot_pos];
+        let name_part = &clean[dot_pos+1..];
+        if let Some(ifaces) = interface_index.get(pkg_part) {
+            if ifaces.contains_key(name_part) {
+                return Some((pkg_part.to_string(), name_part.to_string()));
+            }
+        }
+    } else {
+        // unqualified, search all
+        for (p, ifaces) in interface_index {
+            if ifaces.contains_key(clean) {
+                return Some((p.clone(), clean.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// Try to find exact method for a concrete receiver type.
+fn find_exact_method(method_index: &HashMap<String, Vec<FuncKey>>, recv_type: &str, method: &str) -> Option<FuncKey> {
+    if let Some(cands) = method_index.get(method) {
+        let clean_recv = recv_type.trim_start_matches('*');
+        for k in cands {
+            if let Some(r) = &k.recv {
+                let clean_k = r.trim_start_matches('*');
+                if clean_k == clean_recv || clean_recv.ends_with(clean_k) || clean_k.ends_with(clean_recv) {
+                    return Some(k.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extracts interface definitions from a parsed file.
+/// Returns map: interface_name -> set of method names declared in it.
+fn extract_interfaces(tree: &Tree, source: &str, _pkg: &str) -> HashMap<String, HashSet<String>> {
+    let mut interfaces: HashMap<String, HashSet<String>> = HashMap::new();
+    let root = tree.root_node();
+
+    fn visit(node: Node, source: &str, interfaces: &mut HashMap<String, HashSet<String>>) {
+        if node.kind() == "interface_type" {
+            // Find the parent type_spec to get the interface name
+            let mut current = node;
+            let mut iface_name: Option<String> = None;
+            while let Some(parent) = current.parent() {
+                if parent.kind() == "type_spec" {
+                    if let Some(name_node) = parent.child_by_field_name("name") {
+                        iface_name = Some(name_node.utf8_text(source.as_bytes()).unwrap_or("").to_string());
+                    }
+                    break;
+                }
+                current = parent;
+            }
+
+            if let Some(name) = iface_name {
+                let mut methods = HashSet::new();
+                // Collect method_spec names
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "method_spec" {
+                        if let Some(method_name_node) = child.child_by_field_name("name") {
+                            let mname = method_name_node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                            if !mname.is_empty() {
+                                methods.insert(mname);
+                            }
+                        }
+                    }
+                }
+                if !methods.is_empty() {
+                    interfaces.entry(name).or_default().extend(methods);
+                }
+            }
+        }
+
+        let mut c = node.walk();
+        for child in node.children(&mut c) {
+            visit(child, source, interfaces);
+        }
+    }
+
+    visit(root, source, &mut interfaces);
+    interfaces
 }
 
 fn find_enclosing_func<'a>(infos: &'a [FuncInfo], byte_pos: usize) -> Option<&'a FuncInfo> {
@@ -889,6 +1347,9 @@ fn callee_matches(a: &Callee, b: &Callee) -> bool {
         (Callee::Local(ka), Callee::Local(kb)) => ka == kb,
         (Callee::External(sa), Callee::External(sb)) => sa == sb,
         (Callee::Stdlib(sa), Callee::Stdlib(sb)) => sa == sb,
+        (Callee::Interface { pkg: pa, interface: ia, method: ma }, Callee::Interface { pkg: pb, interface: ib, method: mb }) => {
+            pa == pb && ia == ib && ma == mb
+        }
         _ => false,
     }
 }
@@ -977,6 +1438,9 @@ fn extract_body_elements(
     imports: &HashMap<String, String>,
     module_name: &str,
     method_index: &HashMap<String, Vec<FuncKey>>,
+    interface_index: &HashMap<String, HashMap<String, HashSet<String>>>,
+    scope: &mut HashMap<String, String>,
+    package_level_vars: &HashMap<String, HashMap<String, String>>,
 ) -> Vec<BodyElement> {
     let mut elems = Vec::new();
     let mut cursor = body.walk();
@@ -988,6 +1452,9 @@ fn extract_body_elements(
             imports,
             module_name,
             method_index,
+            interface_index,
+            scope,
+            package_level_vars,
             &mut elems,
         );
     }
@@ -1001,6 +1468,9 @@ fn process_node_for_body(
     imports: &HashMap<String, String>,
     module_name: &str,
     method_index: &HashMap<String, Vec<FuncKey>>,
+    interface_index: &HashMap<String, HashMap<String, HashSet<String>>>,
+    scope: &mut HashMap<String, String>,
+    package_level_vars: &HashMap<String, HashMap<String, String>>,
     elems: &mut Vec<BodyElement>,
 ) {
     match node.kind() {
@@ -1016,6 +1486,9 @@ fn process_node_for_body(
                         imports,
                         module_name,
                         method_index,
+                        interface_index,
+                        scope,
+                        package_level_vars,
                         &mut loop_body,
                     );
                 }
@@ -1032,6 +1505,9 @@ fn process_node_for_body(
                         imports,
                         module_name,
                         method_index,
+                        interface_index,
+                        scope,
+                        package_level_vars,
                     );
                     for cal in cals {
                         elems.push(BodyElement::Call { info: CallInfo {
@@ -1051,6 +1527,9 @@ fn process_node_for_body(
                     imports,
                     module_name,
                     method_index,
+                    interface_index,
+                    scope,
+                    package_level_vars,
                 );
                 for cal in cals {
                     elems.push(BodyElement::Call { info: CallInfo {
@@ -1058,6 +1537,49 @@ fn process_node_for_body(
                         goroutine: false,
                     }});
                 }
+            }
+        }
+        "var_declaration" => {
+            let mut cc = node.walk();
+            for ch in node.children(&mut cc) {
+                if ch.kind() == "var_spec" {
+                    update_scope_from_var_spec(ch, source, current_pkg, imports, scope);
+                }
+            }
+            // Recurse to find calls inside the declaration expressions
+            let mut c = node.walk();
+            for ch in node.children(&mut c) {
+                process_node_for_body(
+                    ch,
+                    source,
+                    current_pkg,
+                    imports,
+                    module_name,
+                    method_index,
+                    interface_index,
+                    scope,
+                    package_level_vars,
+                    elems,
+                );
+            }
+        }
+        "short_var_declaration" => {
+            collect_var_types_from_short_decl(node, source, current_pkg, imports, scope);
+            // Recurse for any calls inside the RHS expressions
+            let mut c = node.walk();
+            for ch in node.children(&mut c) {
+                process_node_for_body(
+                    ch,
+                    source,
+                    current_pkg,
+                    imports,
+                    module_name,
+                    method_index,
+                    interface_index,
+                    scope,
+                    package_level_vars,
+                    elems,
+                );
             }
         }
         _ => {
@@ -1072,6 +1594,9 @@ fn process_node_for_body(
                     imports,
                     module_name,
                     method_index,
+                    interface_index,
+                    scope,
+                    package_level_vars,
                     elems,
                 );
             }
@@ -1099,6 +1624,8 @@ fn populate_body_elements(
     imports: &HashMap<String, String>,
     module_name: &str,
     method_index: &HashMap<String, Vec<FuncKey>>,
+    interface_index: &HashMap<String, HashMap<String, HashSet<String>>>,
+    package_level_vars: &HashMap<String, HashMap<String, String>>,
     graph: &mut CallGraph,
 ) {
     match node.kind() {
@@ -1119,6 +1646,7 @@ fn populate_body_elements(
                 };
 
                 if let Some(body) = node.child_by_field_name("body") {
+                    let mut func_scope = build_signature_scope(node, source, imports, current_pkg);
                     let elems = extract_body_elements(
                         body,
                         source,
@@ -1126,6 +1654,9 @@ fn populate_body_elements(
                         imports,
                         module_name,
                         method_index,
+                        interface_index,
+                        &mut func_scope,
+                        package_level_vars,
                     );
                     // Overwrite the (empty) entry from pass 1 with the structured body
                     graph.insert(key, elems);
@@ -1145,6 +1676,8 @@ fn populate_body_elements(
             imports,
             module_name,
             method_index,
+            interface_index,
+            package_level_vars,
             graph,
         );
     }
@@ -1157,6 +1690,9 @@ fn resolve_call_at_line(
     module_root: &Path,
     module_name: &str,
     defs: &DefMap,
+    interface_index: &HashMap<String, HashMap<String, HashSet<String>>>,
+    _scope: &mut HashMap<String, String>,
+    package_level_vars: &HashMap<String, HashMap<String, String>>,
 ) -> Option<Callee> {
     let source = fs::read_to_string(target_file).ok()?;
     let mut parser = TsParser::new();
@@ -1178,8 +1714,18 @@ fn resolve_call_at_line(
     let call_node = find_innermost_call_at_line(&tree, line)?;
     let func_node = call_node.child_by_field_name("function")?;
 
-    // Resolve (now returns Vec)
-    let candidates = resolve_callee_node(func_node, &source, &pkg, &imports, module_name, &method_index);
+    // Build a scope for the call site by using the enclosing function's signature
+    // plus any var/short-var declarations that appear before this call in source order.
+    let mut site_scope: HashMap<String, String> = HashMap::new();
+    if let Some(enclosing) = find_enclosing_func_node(&tree, call_node.start_byte()) {
+        site_scope = build_signature_scope(enclosing, &source, &imports, &pkg);
+        if let Some(body) = enclosing.child_by_field_name("body") {
+            collect_decls_before(body, &source, &pkg, &imports, call_node.start_byte(), &mut site_scope);
+        }
+    }
+
+    // Resolve (now returns Vec). site_scope has signature + preceding locals; resolve_callee_node also falls back to package_level_vars.
+    let candidates = resolve_callee_node(func_node, &source, &pkg, &imports, module_name, &method_index, interface_index, &site_scope, package_level_vars);
 
     // Prefer a valid local target (for methods this gives us the possible impls)
     let mut first_nonlocal: Option<Callee> = None;
@@ -1241,6 +1787,57 @@ fn find_innermost_call_at_line(tree: &Tree, line: usize) -> Option<Node<'_>> {
     }
 
     find_node_at_range(tree.root_node(), start_b)
+}
+
+fn find_enclosing_func_node<'a>(tree: &'a Tree, byte_pos: usize) -> Option<Node<'a>> {
+    fn visit<'a>(node: Node<'a>, pos: usize) -> Option<Node<'a>> {
+        if node.kind() == "function_declaration" || node.kind() == "method_declaration" {
+            if let Some(body) = node.child_by_field_name("body") {
+                if pos >= body.start_byte() && pos < body.end_byte() {
+                    return Some(node);
+                }
+            }
+        }
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            if let Some(f) = visit(ch, pos) {
+                return Some(f);
+            }
+        }
+        None
+    }
+    visit(tree.root_node(), byte_pos)
+}
+
+fn collect_decls_before(
+    node: Node,
+    source: &str,
+    current_pkg: &str,
+    imports: &HashMap<String, String>,
+    cutoff: usize,
+    scope: &mut HashMap<String, String>,
+) {
+    if node.start_byte() >= cutoff {
+        return;
+    }
+    match node.kind() {
+        "var_declaration" => {
+            let mut cc = node.walk();
+            for ch in node.children(&mut cc) {
+                if ch.kind() == "var_spec" {
+                    update_scope_from_var_spec(ch, source, current_pkg, imports, scope);
+                }
+            }
+        }
+        "short_var_declaration" => {
+            collect_var_types_from_short_decl(node, source, current_pkg, imports, scope);
+        }
+        _ => {}
+    }
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        collect_decls_before(ch, source, current_pkg, imports, cutoff, scope);
+    }
 }
 
 /// Fallback: given a line, find if it's inside one of the indexed functions and return its key.
@@ -1425,6 +2022,16 @@ fn print_body_elements(
                             color_goroutine(&format!("go {}", base))
                         } else {
                             color_external(&format!("[stdlib] {}", base))  // reuse color or could make specific
+                        };
+                        println!("{}{}{}", ind, prefix, display);
+                    }
+                    Callee::Interface { pkg, interface, method } => {
+                        let desc = format!("{}.{}.{}", pkg, interface, method);
+                        let display = if info.goroutine {
+                            color_goroutine(&format!("go {}", desc))
+                        } else {
+                            // Special color or reuse stdlib-like for interfaces
+                            color_external(&format!("[interface] {}", desc))
                         };
                         println!("{}{}{}", ind, prefix, display);
                     }
