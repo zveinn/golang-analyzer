@@ -13,6 +13,20 @@ struct FuncKey {
     name: Arc<str>,
 }
 
+impl serde::Serialize for FuncKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("FuncKey", 3)?;
+        state.serialize_field("pkg", &*self.pkg)?;
+        state.serialize_field("recv", &self.recv.as_ref().map(|s| s.as_ref()))?;
+        state.serialize_field("name", &*self.name)?;
+        state.end()
+    }
+}
+
 impl FuncKey {
     fn display(&self) -> String {
         match &self.recv {
@@ -22,45 +36,119 @@ impl FuncKey {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 enum Callee {
     Local(FuncKey),
-    External(Arc<str>), // third-party / external modules
-    Stdlib(Arc<str>),   // Go standard library
+    External(String),
+    Stdlib(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 struct CallInfo {
     callee: Callee,
     goroutine: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "kind")]
 enum BodyElement {
-    Call(CallInfo),
+    Call { info: CallInfo },
     Loop { body: Vec<BodyElement> },
 }
 
 
 
 #[derive(Parser, Debug)]
-#[command(name = "code-analyzer", version, about = "Analyze Go function execution chains with minimal memory usage")]
+#[command(name = "code-analyzer", version, about = "Analyze Go function execution chains. Run with file+line for CLI, or as server for UI.")]
 struct Cli {
-    /// Path to a Go source file containing the call site
-    #[arg(value_name = "FILE")]
-    file: PathBuf,
+    /// HTTP address for UI and WebSocket
+    #[arg(long, default_value = "0.0.0.0:1111")]
+    addr: String,
 
-    /// 1-based line number of the call
+    /// TCP address for receiving file:line triggers
+    #[arg(long, default_value = "0.0.0.0:2222")]
+    tcp_addr: String,
+
+    /// Optional: Path to Go source file (for direct CLI mode)
+    #[arg(value_name = "FILE")]
+    file: Option<PathBuf>,
+
+    /// Optional: 1-based line number (for direct CLI mode)
     #[arg(value_name = "LINE")]
-    line: usize,
+    line: Option<usize>,
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    if let Err(e) = run(&cli.file, cli.line) {
-        eprintln!("error: {e}");
+    if let (Some(file), Some(line)) = (&cli.file, cli.line) {
+        // Direct CLI mode (original behavior)
+        if let Err(e) = run(file, line) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // Server mode - run the async server
+    if let Err(e) = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(run_server(&cli.addr, &cli.tcp_addr))
+    {
+        eprintln!("server error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[derive(serde::Serialize, Clone)]
+struct AnalysisPayload {
+    root: FuncKey,
+    body: Vec<BodyElement>,
+    graph: Vec<(FuncKey, Vec<BodyElement>)>,
+}
+
+fn perform_analysis(file: &Path, line: usize) -> Result<AnalysisPayload, String> {
+    let abs_file = if file.is_absolute() {
+        file.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(|e| e.to_string())?.join(file)
+    };
+
+    let (module_root, module_name) = find_go_module(&abs_file)
+        .ok_or_else(|| "Could not find go.mod".to_string())?;
+
+    let (graph, defs) = build_call_graph(&module_root, &module_name)
+        .map_err(|e| e.to_string())?;
+
+    let mut start_callee = resolve_call_at_line(&abs_file, line, &module_root, &module_name, &defs);
+
+    if start_callee.is_none() {
+        // Fallback: if the line is inside a known local function, analyze from that function definition.
+        if let Some(key) = find_enclosing_function_key(&abs_file, line, &module_root, &module_name, &defs) {
+            start_callee = Some(Callee::Local(key));
+        }
+    }
+
+    let start_callee = start_callee.ok_or_else(|| "Could not locate a resolvable call or enclosing function at the given line.".to_string())?;
+
+    match start_callee {
+        Callee::Local(key) => {
+            let body = graph.get(&key).cloned().unwrap_or_default();
+            let graph_list: Vec<_> = graph.into_iter().collect();
+            Ok(AnalysisPayload { root: key, body, graph: graph_list })
+        }
+        Callee::External(name) | Callee::Stdlib(name) => {
+            let fake_key = FuncKey {
+                pkg: Arc::from("external"),
+                recv: None,
+                name: Arc::from(name.as_str()),
+            };
+            Ok(AnalysisPayload {
+                root: fake_key,
+                body: vec![],
+                graph: vec![],
+            })
+        }
     }
 }
 
@@ -118,6 +206,157 @@ fn run(file: &Path, line: usize) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
+use rust_embed::RustEmbed;
+use tokio::sync::broadcast;
+
+#[derive(RustEmbed)]
+#[folder = "ui/dist"]
+struct Assets;
+
+async fn serve_embedded(path: &str) -> impl IntoResponse {
+    let path = if path.is_empty() { "index.html" } else { path };
+    match Assets::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            ([("content-type", mime.to_string())], content.data).into_response()
+        }
+        None => {
+            // Fallback to index for SPA
+            if let Some(content) = Assets::get("index.html") {
+                ([("content-type", "text/html".to_string())], content.data).into_response()
+            } else {
+                (axum::http::StatusCode::NOT_FOUND, "Not found").into_response()
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AppState {
+    tx: broadcast::Sender<String>, // JSON of AnalysisPayload
+}
+
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_socket(socket, state))
+}
+
+async fn handle_socket(mut socket: WebSocket, state: AppState) {
+    let mut rx = state.tx.subscribe();
+
+    // Send current if any? For now, client will get next update.
+    // You can store latest in state if wanted.
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                if let Ok(json) = msg {
+                    if socket.send(Message::Text(json)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Some(msg) = socket.recv() => {
+                if msg.is_err() {
+                    break;
+                }
+            }
+            else => break,
+        }
+    }
+}
+
+async fn run_server(http_addr: &str, tcp_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Starting server...");
+    println!("  HTTP UI + WS: http://{}", http_addr);
+    println!("  TCP trigger : {}", tcp_addr);
+    println!("Send file:line over TCP to trigger analysis (e.g. echo 'main.go:145' | nc localhost 2222)");
+
+    let (tx, _rx) = broadcast::channel::<String>(16);
+    let state = AppState { tx: tx.clone() };
+
+    // HTTP router
+    let app = Router::new()
+        .route("/ws", get(ws_handler))
+        .route("/*path", get(|axum::extract::Path(path): axum::extract::Path<String>| async move {
+            serve_embedded(&path).await
+        }))
+        .route("/", get(|| async { serve_embedded("").await }))
+        .with_state(state.clone());
+
+    let http_addr = http_addr.to_string();
+    let tcp_addr = tcp_addr.to_string();
+    let tx_clone = tx.clone();
+
+    // Spawn TCP listener
+    tokio::spawn(async move {
+        if let Err(e) = run_tcp_listener(&tcp_addr, tx_clone).await {
+            eprintln!("TCP listener error: {}", e);
+        }
+    });
+
+    // Run HTTP server
+    let listener = tokio::net::TcpListener::bind(&http_addr).await?;
+    println!("HTTP server listening on {}", http_addr);
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+async fn run_tcp_listener(addr: &str, tx: broadcast::Sender<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    println!("TCP listener listening on {}", addr);
+
+    loop {
+        let (socket, _) = listener.accept().await?;
+        let tx = tx.clone();
+
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut reader = BufReader::new(socket);
+            let mut line = String::new();
+
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let data = line.trim().to_string();
+                        if data.is_empty() { continue; }
+
+                        if let Some((file_str, line_str)) = data.rsplit_once(':') {
+                            if let Ok(line) = line_str.trim().parse::<usize>() {
+                                let path = std::path::PathBuf::from(file_str.trim());
+                                println!("Received trigger: {}:{}", path.display(), line);
+
+                                match perform_analysis(&path, line) {
+                                    Ok(payload) => {
+                                        if let Ok(json) = serde_json::to_string(&payload) {
+                                            let _ = tx.send(json);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Analysis error: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
 }
 
 /// Walk up from the given file to find go.mod.
@@ -545,7 +784,7 @@ fn resolve_callee_node(
             if let Some(full_import) = imports.get(&operand_text) {
                 if is_standard_library(full_import) {
                     let desc = format!("{}.{}", full_import, called_name);
-                    return vec![Callee::Stdlib(Arc::from(desc.as_str()))];
+                    return vec![Callee::Stdlib(desc)];
                 }
                 if full_import.starts_with(module_name) {
                     let key = FuncKey {
@@ -556,7 +795,7 @@ fn resolve_callee_node(
                     return vec![Callee::Local(key)];
                 } else {
                     let ext = format!("{}.{}", full_import, called_name);
-                    return vec![Callee::External(Arc::from(ext.as_str()))];
+                    return vec![Callee::External(ext)];
                 }
             }
 
@@ -567,11 +806,11 @@ fn resolve_callee_node(
                     if let Some(full) = imports.get(op_op_text) {
                         if is_standard_library(full) {
                             let desc = format!("{}.{}.{}", full, op_field.utf8_text(source.as_bytes()).unwrap_or(""), called_name);
-                            return vec![Callee::Stdlib(Arc::from(desc.as_str()))];
+                            return vec![Callee::Stdlib(desc)];
                         }
                         if full.starts_with(module_name) {
                             let ext = format!("{}.{}.{}", full, op_field.utf8_text(source.as_bytes()).unwrap_or(""), called_name);
-                            return vec![Callee::External(Arc::from(ext.as_str()))];
+                            return vec![Callee::External(ext)];
                         }
                     }
                 }
@@ -596,12 +835,12 @@ fn resolve_callee_node(
                 if let Some(full_import) = imports.get(&operand_text) {
                     if is_standard_library(full_import) {
                         let desc = format!("{}.{}", full_import, called_name);
-                        out.push(Callee::Stdlib(Arc::from(desc.as_str())));
+                        out.push(Callee::Stdlib(desc));
                     } else {
-                        out.push(Callee::External(Arc::from(raw.as_str())));
+                        out.push(Callee::External(raw));
                     }
                 } else {
-                    out.push(Callee::External(Arc::from(raw.as_str())));
+                    out.push(Callee::External(raw));
                 }
             }
 
@@ -708,7 +947,7 @@ fn format_annotations(in_loop: bool, _goroutine: bool) -> String {
 fn clean_body_elements(elements: &mut [BodyElement], defs: &DefMap) {
     for elem in elements.iter_mut() {
         match elem {
-            BodyElement::Call(ci) => {
+            BodyElement::Call { info: ci } => {
                 if let Callee::Local(k) = &ci.callee {
                     if !defs.contains_key(k) {
                         let short = if let Some(r) = &k.recv {
@@ -716,7 +955,7 @@ fn clean_body_elements(elements: &mut [BodyElement], defs: &DefMap) {
                         } else {
                             k.name.to_string()
                         };
-                        ci.callee = Callee::External(Arc::from(short.as_str()));
+                        ci.callee = Callee::External(short);
                     }
                 }
             }
@@ -795,10 +1034,10 @@ fn process_node_for_body(
                         method_index,
                     );
                     for cal in cals {
-                        elems.push(BodyElement::Call(CallInfo {
+                        elems.push(BodyElement::Call { info: CallInfo {
                             callee: cal,
                             goroutine: true,
-                        }));
+                        }});
                     }
                 }
             }
@@ -814,10 +1053,10 @@ fn process_node_for_body(
                     method_index,
                 );
                 for cal in cals {
-                    elems.push(BodyElement::Call(CallInfo {
+                    elems.push(BodyElement::Call { info: CallInfo {
                         callee: cal,
                         goroutine: false,
-                    }));
+                    }});
                 }
             }
         }
@@ -1099,7 +1338,7 @@ fn print_execution_tree(
 fn has_printable_content(elements: &[BodyElement]) -> bool {
     for elem in elements {
         match elem {
-            BodyElement::Call(_) => return true,
+            BodyElement::Call { .. } => return true,
             BodyElement::Loop { body } => {
                 if has_printable_content(body) {
                     return true;
@@ -1130,7 +1369,7 @@ fn print_body_elements(
     let printable: Vec<&BodyElement> = elements
         .iter()
         .filter(|e| match e {
-            BodyElement::Call(_) => true,
+            BodyElement::Call { .. } => true,
             BodyElement::Loop { body } => has_printable_content(body),
         })
         .collect();
@@ -1143,7 +1382,7 @@ fn print_body_elements(
 
         let elem = *elem;
         match elem {
-            BodyElement::Call(info) => {
+            BodyElement::Call { info } => {
                 match &info.callee {
                     Callee::Local(child_key) => {
                         let child_loc = defs.get(child_key)
