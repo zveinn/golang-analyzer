@@ -56,6 +56,8 @@ struct CallInfo {
     goroutine: bool,
     /// Raw source text of each argument expression at the call site (for tracing).
     args: Vec<String>,
+    /// For method calls, the receiver/base expression (e.g. "FR.Server" for FR.Server.GetURL)
+    receiver: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -66,6 +68,18 @@ enum BodyElement {
     /// Variable definition (from var := or var decl). Used for intra-function
     /// parameter/variable tracing. Not displayed as a visible row in UI.
     Def { name: String, rhs: String },
+    /// Channel send operation: `channel <- value`
+    ChannelSend { channel: String, value: String, owner_type: Option<String> },
+    /// Channel receive (e.g. `x := <-ch` or `case x := <-ch:` or `<-ch`)
+    ChannelRecv { channel: String, target: Option<String>, owner_type: Option<String> },
+    /// Execution of a callback / anonymous function passed to a higher-order function.
+    /// This keeps the structure so we can show that e.g. Delete happened *inside* the
+    /// callback passed to tunnelMetaMapRange rather than directly in the caller.
+    Callback {
+        /// Name of the parameter the callback was passed to, if known (e.g. "do")
+        name: Option<String>,
+        body: Vec<BodyElement>,
+    },
 }
 
 
@@ -502,6 +516,7 @@ fn build_call_graph(module_root: &Path, module_name: &str) -> Result<(CallGraph,
         method_defs: Vec<FuncKey>, // only those with recv for method_index
         imports: HashMap<String, String>,
         typed_vars: HashMap<String, String>, // top level var name -> type
+        returns: Vec<(FuncKey, Vec<String>)>, // for general return type inference (range vars, etc.)
     }
 
     let def_results: Vec<FileDefs> = go_files.par_iter().map(|file_path| {
@@ -533,9 +548,14 @@ fn build_call_graph(module_root: &Path, module_name: &str) -> Result<(CallGraph,
         // Extract top level typed vars for globals
         res.typed_vars = extract_top_level_typed_vars(&tree, &source, &res.pkg, &res.imports);
 
+        // Extract return types for general inference (e.g. element types for range vars in channel owner resolution)
+        res.returns = extract_returns(&tree, &source, &res.pkg);
+
         // Note: we don't drop explicitly; they go out of scope.
         res
     }).collect();
+
+    let mut return_map: HashMap<FuncKey, Vec<String>> = HashMap::new();
 
     // Merge results sequentially
     for r in def_results {
@@ -561,8 +581,12 @@ fn build_call_graph(module_root: &Path, module_name: &str) -> Result<(CallGraph,
                 .or_default()
                 .push(k);
         }
+        for (k, rets) in r.returns {
+            return_map.insert(k, rets);  // will declare return_map later
+        }
     }
 
+    let return_map = Arc::new(return_map);
     let mut param_map: HashMap<FuncKey, Vec<String>> = HashMap::new();
 
     // === PASS 2: Extract calls in parallel ===
@@ -599,6 +623,8 @@ fn build_call_graph(module_root: &Path, module_name: &str) -> Result<(CallGraph,
         // First, make sure entries exist for funcs in this file (we can re-extract or use previous).
         // For simplicity, we call populate which inserts into the provided graph.
         // To avoid global mutation, we use a per-file graph here.
+        let return_map = Arc::clone(&return_map);
+        let return_map_for_file = &*return_map;
         populate_body_elements(
             root,
             &source,
@@ -610,6 +636,7 @@ fn build_call_graph(module_root: &Path, module_name: &str) -> Result<(CallGraph,
             &package_level_vars,
             &mut file_graph,
             &mut file_params,
+            return_map_for_file,
         );
 
         for (k, b) in file_graph {
@@ -850,6 +877,7 @@ fn extract_resolved_calls(
                             callee: c,
                             goroutine: now_in_goroutine,
                             args: vec![],
+                            receiver: None,
                         })
                         .collect();
                     out.push((node.start_byte(), infos));
@@ -938,14 +966,38 @@ fn resolve_callee_node(
 
             // Method call on a value (e.g. c.Method() or obj.Field()).
             // Use scope to find the static type of the operand (receiver).
+            // For chained receivers like "req.Header" we fall back to the root var ("req")
+            // so we can still detect that it is e.g. a *http.Request and treat .Add etc as stdlib.
             let mut out = vec![];
 
-            let receiver_type = scope.get(&operand_text).cloned().or_else(|| {
-                package_level_vars.get(current_pkg).and_then(|m| m.get(&operand_text)).cloned()
-            });
+            let root = root_identifier(&operand_text);
+            let receiver_type = scope.get(&operand_text)
+                .or_else(|| scope.get(root))
+                .cloned()
+                .or_else(|| {
+                    package_level_vars.get(current_pkg).and_then(|m| {
+                        m.get(&operand_text).or_else(|| m.get(root)).cloned()
+                    })
+                });
 
             if let Some(typ) = &receiver_type {
                 let normalized = normalize_type(typ.clone(), imports, current_pkg);
+
+                // Check if the *receiver type* itself comes from the standard library
+                // (e.g. atomic.Pointer[T], sync.Mutex, http.Request, etc.).
+                // Support both forms: "http.Request" (alias in source) and "net/http.Request" (normalized).
+                let type_pkg = normalized.split(|c| c == '.' || c == '[').next().unwrap_or(&normalized);
+                let is_std = if let Some(full) = imports.get(type_pkg) {
+                    is_standard_library(full)
+                } else {
+                    is_standard_library(type_pkg)
+                };
+                if is_std {
+                    // Keep the original source expression (e.g. "req.Header.Add") for natural display
+                    // while classifying it as Stdlib so it gets the correct badge/color instead of "external".
+                    let desc = format!("{}.{}", operand_text, called_name);
+                    return vec![Callee::Stdlib(desc)];
+                }
 
                 // 1. Check if it matches a known interface
                 if let Some((iface_pkg, iface_name)) = find_interface_for_type(&normalized, interface_index) {
@@ -971,12 +1023,34 @@ fn resolve_callee_node(
             // If we reach here without a known receiver type, do not explode into
             // all name-matching methods or every iface sharing the method name.
             // Report as a descriptive external call instead.
+            // But first try to recognize stdlib via the root identifier of the receiver expr
+            // (handles "req.Header.Add", "client.Do", etc. when the var type is from net/http etc).
             if out.is_empty() {
                 let raw = format!("{}.{}", operand_text, called_name);
-                if let Some(full_import) = imports.get(&operand_text) {
+                let root = root_identifier(&operand_text);
+
+                // Direct import alias on the root (pkg.something case) or operand
+                if let Some(full_import) = imports.get(&operand_text).or_else(|| imports.get(root)) {
                     if is_standard_library(full_import) {
                         let desc = format!("{}.{}", full_import, called_name);
                         out.push(Callee::Stdlib(desc));
+                    } else {
+                        out.push(Callee::External(raw));
+                    }
+                } else if let Some(typ) = scope.get(root)
+                    .cloned()
+                    .or_else(|| package_level_vars.get(current_pkg).and_then(|m| m.get(root).cloned()))
+                {
+                    let norm = normalize_type(typ, imports, current_pkg);
+                    let type_pkg = norm.split(|c| c == '.' || c == '[').next().unwrap_or(&norm);
+                    let is_std = if let Some(full) = imports.get(type_pkg) {
+                        is_standard_library(full)
+                    } else {
+                        is_standard_library(type_pkg)
+                    };
+                    if is_std {
+                        // Keep source form (e.g. req.Header.Add) but as Stdlib variant.
+                        out.push(Callee::Stdlib(raw.clone()));
                     } else {
                         out.push(Callee::External(raw));
                     }
@@ -1009,6 +1083,12 @@ fn is_standard_library(import_path: &str) -> bool {
     !first.contains('.')
 }
 
+/// Return the root identifier of a possibly selector expression, e.g.
+/// "req.Header" → "req", "http.NewRequest" → "http", "foo" → "foo".
+fn root_identifier(expr: &str) -> &str {
+    expr.split('.').next().unwrap_or(expr).trim()
+}
+
 /// Extract raw argument expression texts from a call_expression node.
 fn extract_call_args(call_node: Node, source: &str) -> Vec<String> {
     let mut args = Vec::new();
@@ -1027,6 +1107,22 @@ fn extract_call_args(call_node: Node, source: &str) -> Vec<String> {
         }
     }
     args
+}
+
+/// Extract the receiver/base expression text for method calls, e.g. "FR.Server" for `FR.Server.GetURL(...)`.
+/// Returns None for plain identifier calls like `foo()`.
+fn extract_call_receiver(call_node: Node, source: &str) -> Option<String> {
+    if let Some(func_node) = call_node.child_by_field_name("function") {
+        if func_node.kind() == "selector_expression" {
+            if let Some(operand) = func_node.child_by_field_name("operand") {
+                let txt = operand.utf8_text(source.as_bytes()).unwrap_or("").trim().to_string();
+                if !txt.is_empty() {
+                    return Some(txt);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Extract formal parameter names (including receiver for methods) from a
@@ -1078,6 +1174,65 @@ fn extract_params(node: Node, source: &str) -> Vec<String> {
     out
 }
 
+fn extract_return_types(node: Node, source: &str) -> Vec<String> {
+    let mut types = vec![];
+    if let Some(result) = node.child_by_field_name("result") {
+        let mut c = result.walk();
+        for child in result.children(&mut c) {
+            if child.kind() == "parameter_declaration" {
+                for j in 0..child.child_count() {
+                    if let Some(tnode) = child.child(j) {
+                        if looks_like_type_node(tnode.kind()) || tnode.kind() == "pointer_type" || tnode.kind() == "qualified_type" {
+                            let ty = tnode.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                            if !ty.is_empty() {
+                                types.push(ty);
+                            }
+                        }
+                    }
+                }
+            } else if looks_like_type_node(child.kind()) || child.kind() == "pointer_type" || child.kind() == "qualified_type" {
+                let ty = child.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                if !ty.is_empty() {
+                    types.push(ty);
+                }
+            }
+        }
+    }
+    types
+}
+
+fn extract_returns(tree: &Tree, source: &str, pkg: &str) -> Vec<(FuncKey, Vec<String>)> {
+    let mut map: HashMap<FuncKey, Vec<String>> = HashMap::new();
+    let root = tree.root_node();
+    fn visit(node: Node, source: &str, pkg: &str, map: &mut HashMap<FuncKey, Vec<String>>) {
+        if node.kind() == "function_declaration" || node.kind() == "method_declaration" {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = name_node.utf8_text(source.as_bytes()).unwrap_or("??").to_string();
+                let recv = if node.kind() == "method_declaration" {
+                    extract_receiver_type(node, source).map(|r| Arc::from(r.as_str()))
+                } else {
+                    None
+                };
+                let key = FuncKey {
+                    pkg: Arc::from(pkg),
+                    recv,
+                    name: Arc::from(name.as_str()),
+                };
+                let rets = extract_return_types(node, source);
+                if !rets.is_empty() {
+                    map.insert(key, rets);
+                }
+            }
+        }
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            visit(ch, source, pkg, map);
+        }
+    }
+    visit(root, source, pkg, &mut map);
+    map.into_iter().collect()
+}
+
 /// Build initial type scope for a function/method from its signature (receiver + parameters).
 fn build_signature_scope(node: Node, source: &str, imports: &HashMap<String, String>, current_pkg: &str) -> HashMap<String, String> {
     let mut scope: HashMap<String, String> = HashMap::new();
@@ -1094,7 +1249,7 @@ fn build_signature_scope(node: Node, source: &str, imports: &HashMap<String, Str
                             if let Some(ch) = param_decl.child(j) {
                                 match ch.kind() {
                                     "identifier" => var_name = ch.utf8_text(source.as_bytes()).unwrap_or("").to_string(),
-                                    "pointer_type" | "type_identifier" | "qualified_type" => {
+                                    k if looks_like_type_node(k) => {
                                         typ = ch.utf8_text(source.as_bytes()).unwrap_or("").to_string();
                                     }
                                     _ => {}
@@ -1121,7 +1276,7 @@ fn build_signature_scope(node: Node, source: &str, imports: &HashMap<String, Str
                         if let Some(ch) = param_decl.child(j) {
                             match ch.kind() {
                                 "identifier" => var_names.push(ch.utf8_text(source.as_bytes()).unwrap_or("").to_string()),
-                                "pointer_type" | "type_identifier" | "qualified_type" | "array_type" | "map_type" | "chan_type" => {
+                                k if looks_like_type_node(k) || matches!(k, "array_type" | "map_type" | "chan_type" | "slice_type") => {
                                     typ = ch.utf8_text(source.as_bytes()).unwrap_or("").to_string();
                                 }
                                 _ => {}
@@ -1147,17 +1302,35 @@ fn build_signature_scope(node: Node, source: &str, imports: &HashMap<String, Str
 }
 
 fn normalize_type(typ: String, imports: &HashMap<String, String>, current_pkg: &str) -> String {
-    let t = typ.trim().trim_start_matches('*').to_string();
-    if t.contains('.') {
-        return t;
+    let orig = typ.trim().to_string();
+    let t = orig.trim_start_matches('*').to_string();
+    // Determine the base type name before any generic args for qualification decisions.
+    // This prevents e.g. "Foo[bar.Baz]" from being treated as already-qualified
+    // due to the '.' inside the type argument.
+    let base = if let Some(pos) = t.find('[') { &t[..pos] } else { &t };
+    if base.contains('.') {
+        return orig;
     }
-    if let Some(full) = imports.get(&t) {
-        return full.clone();
+    if let Some(full) = imports.get(base) {
+        if base == t {
+            return full.clone();
+        }
+        // Reattach generic args etc. after the imported base
+        let rest = &t[base.len()..];
+        return format!("{}{}", full, rest);
     }
     if t == "error" || t == "string" || t == "int" || t == "bool" { // builtins
         return t;
     }
     format!("{}.{}", current_pkg, t)
+}
+
+fn looks_like_type_node(kind: &str) -> bool {
+    kind == "pointer_type"
+        || kind == "generic_type"
+        || kind == "type_identifier"
+        || kind == "qualified_type"
+        || kind.ends_with("type")
 }
 
 /// Best-effort inference of a raw receiver type string (e.g. "*Foo", "Bar", "pkg.Qux")
@@ -1284,7 +1457,7 @@ fn update_scope_from_var_spec(
     for cch in spec.children(&mut ccc) {
         match cch.kind() {
             "identifier" => names.push(cch.utf8_text(source.as_bytes()).unwrap_or("").to_string()),
-            "pointer_type" | "type_identifier" | "qualified_type" => {
+            k if looks_like_type_node(k) => {
                 typ = cch.utf8_text(source.as_bytes()).unwrap_or("").to_string();
             }
             _ => {}
@@ -1319,6 +1492,13 @@ fn extract_top_level_typed_vars(tree: &Tree, source: &str, pkg: &str, imports: &
             for ch in node.children(&mut cc) {
                 if ch.kind() == "var_spec" {
                     update_scope_from_var_spec(ch, source, pkg, imports, vars);
+                } else if ch.kind() == "var_spec_list" {
+                    let mut lc = ch.walk();
+                    for sub in ch.children(&mut lc) {
+                        if sub.kind() == "var_spec" {
+                            update_scope_from_var_spec(sub, source, pkg, imports, vars);
+                        }
+                    }
                 }
             }
         }
@@ -1335,20 +1515,34 @@ fn extract_top_level_typed_vars(tree: &Tree, source: &str, pkg: &str, imports: &
 /// Try to find if a type corresponds to a known interface.
 fn find_interface_for_type(typ: &str, interface_index: &HashMap<String, HashMap<String, HashSet<String>>>) -> Option<(String, String)> {
     let clean = typ.trim_start_matches('*');
+    // Use base name (strip generics) for lookup, and take last segment before any generic dot issues.
+    let base = base_type_name(clean);
+    // Also compute a "pkg" by looking at the original before stripping last segment.
+    // For interface matching we try the full normalized if possible, fallback to base name search.
     if let Some(dot_pos) = clean.rfind('.') {
+        // Try the original split first (may be wrong for generics, fallthrough)
         let pkg_part = &clean[..dot_pos];
-        let name_part = &clean[dot_pos+1..];
+        let name_part = &clean[dot_pos + 1..];
+        // clean the name_part of generics too for match
+        let name_clean = if let Some(b) = name_part.find('[') { &name_part[..b] } else { name_part };
         if let Some(ifaces) = interface_index.get(pkg_part) {
+            if ifaces.contains_key(name_clean) {
+                return Some((pkg_part.to_string(), name_clean.to_string()));
+            }
             if ifaces.contains_key(name_part) {
                 return Some((pkg_part.to_string(), name_part.to_string()));
             }
         }
-    } else {
-        // unqualified, search all
-        for (p, ifaces) in interface_index {
-            if ifaces.contains_key(clean) {
-                return Some((p.clone(), clean.to_string()));
-            }
+    }
+    // Fallback: search using base name across packages (common for same-pkg or unqualified)
+    for (p, ifaces) in interface_index {
+        if ifaces.contains_key(&base) {
+            return Some((p.clone(), base.clone()));
+        }
+        // also try the raw clean without generics
+        let c2 = if let Some(b) = clean.find('[') { &clean[..b] } else { clean };
+        if ifaces.contains_key(c2) {
+            return Some((p.clone(), c2.to_string()));
         }
     }
     None
@@ -1357,13 +1551,91 @@ fn find_interface_for_type(typ: &str, interface_index: &HashMap<String, HashMap<
 /// Try to find exact method for a concrete receiver type.
 fn find_exact_method(method_index: &HashMap<String, Vec<FuncKey>>, recv_type: &str, method: &str) -> Option<FuncKey> {
     if let Some(cands) = method_index.get(method) {
-        let clean_recv = recv_type.trim_start_matches('*');
+        let recv_base = base_type_name(recv_type);
         for k in cands {
             if let Some(r) = &k.recv {
-                let clean_k = r.trim_start_matches('*');
-                if clean_k == clean_recv || clean_recv.ends_with(clean_k) || clean_k.ends_with(clean_recv) {
+                let k_base = base_type_name(r);
+                if k_base == recv_base || recv_base.ends_with(&k_base) || k_base.ends_with(&recv_base) {
                     return Some(k.clone());
                 }
+            }
+        }
+    }
+    None
+}
+
+fn base_type_name(typ: &str) -> String {
+    let mut t = typ.trim().trim_start_matches('*').to_string();
+    // Strip generic type arguments for matching, e.g. "SomeType[Arg]" -> "SomeType"
+    if let Some(pos) = t.find('[') {
+        t = t[..pos].to_string();
+    }
+    // If qualified, take last segment as the type name (methods are defined in the type's package)
+    if let Some(dot) = t.rfind('.') {
+        t = t[dot + 1..].to_string();
+    }
+    t
+}
+
+/// Resolve the static type of the *base expression* that is used to access a channel field or var.
+/// E.g. for "t.ch" returns the type of "t".
+/// This allows exact correlation of sends/recvs on the same struct's channel field
+/// without guessing by field name alone.
+fn resolve_channel_base_type(
+    maybe_channel_node: Option<Node>,
+    source: &str,
+    current_pkg: &str,
+    _imports: &HashMap<String, String>,
+    scope: &HashMap<String, String>,
+    package_level_vars: &HashMap<String, HashMap<String, String>>,
+) -> Option<String> {
+    let ch_node = maybe_channel_node?;
+    let expr_to_resolve = if ch_node.kind() == "selector_expression" {
+        ch_node.child_by_field_name("operand")
+    } else if ch_node.kind() == "unary_expression" {
+        // for <-operand , the operand may be selector or ident
+        ch_node.child_by_field_name("operand")
+    } else {
+        Some(ch_node)
+    }?;
+
+    let txt = expr_to_resolve.utf8_text(source.as_bytes()).unwrap_or("").trim().to_string();
+    if txt.is_empty() {
+        return None;
+    }
+
+    // If it's itself a selector (e.g. g.targets or something), resolve the root
+    let base_txt = if expr_to_resolve.kind() == "selector_expression" {
+        expr_to_resolve.child_by_field_name("operand")
+            .map(|o| o.utf8_text(source.as_bytes()).unwrap_or("").to_string())
+            .unwrap_or(txt.clone())
+    } else {
+        txt.clone()
+    };
+
+    scope.get(&base_txt).cloned()
+        .or_else(|| package_level_vars.get(current_pkg).and_then(|m| m.get(&base_txt)).cloned())
+        .or_else(|| scope.get(&txt).cloned())
+        .or_else(|| package_level_vars.get(current_pkg).and_then(|m| m.get(&txt)).cloned())
+}
+
+/// Given a container type string like "[]*T" or "[]T" or "map[K]V" or "chan T",
+/// return the element type if possible.
+fn element_type_of_container(typ: &str) -> Option<String> {
+    let t = typ.trim().trim_start_matches('*').to_string();
+    if let Some(rest) = t.strip_prefix("[]") {
+        // []*T or []T -> *T or T
+        return Some(rest.to_string());
+    }
+    if let Some(rest) = t.strip_prefix("chan ") {
+        return Some(rest.trim().to_string());
+    }
+    if t.starts_with("map[") {
+        // For maps, we could return value type, but for now not used for channels.
+        if let Some(bracket) = t.find(']') {
+            let val = t[bracket+1..].trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
             }
         }
     }
@@ -1518,7 +1790,10 @@ fn clean_body_elements(elements: &mut [BodyElement], defs: &DefMap) {
             BodyElement::Loop { body } => {
                 clean_body_elements(body, defs);
             }
-            BodyElement::Def { .. } => {}
+            BodyElement::Callback { body, .. } => {
+                clean_body_elements(body, defs);
+            }
+            BodyElement::Def { .. } | BodyElement::ChannelSend { .. } | BodyElement::ChannelRecv { .. } => {}
         }
     }
 }
@@ -1537,6 +1812,7 @@ fn extract_body_elements(
     interface_index: &HashMap<String, HashMap<String, HashSet<String>>>,
     scope: &mut HashMap<String, String>,
     package_level_vars: &HashMap<String, HashMap<String, String>>,
+    return_map: &HashMap<FuncKey, Vec<String>>,
 ) -> Vec<BodyElement> {
     let mut elems = Vec::new();
     let mut cursor = body.walk();
@@ -1552,6 +1828,7 @@ fn extract_body_elements(
             scope,
             package_level_vars,
             &mut elems,
+            return_map,
         );
     }
     elems
@@ -1568,9 +1845,75 @@ fn process_node_for_body(
     scope: &mut HashMap<String, String>,
     package_level_vars: &HashMap<String, HashMap<String, String>>,
     elems: &mut Vec<BodyElement>,
+    return_map: &HashMap<FuncKey, Vec<String>>,
 ) {
     match node.kind() {
         "for_statement" => {
+            // Introduce range variables into scope with element type when possible.
+            // This helps resolve the base of channels like `t.ch` when `t` comes from
+            // ranging over a slice of struct pointers (common for owner/channel correlation).
+            let mut c = node.walk();
+            for child in node.children(&mut c) {
+                if child.kind() == "range_clause" {
+                    let mut lhs_vars: Vec<String> = vec![];
+                    let mut range_expr_type: Option<String> = None;
+
+                    let mut cc = child.walk();
+                    for sub in child.children(&mut cc) {
+                        if sub.kind() == "expression_list" {
+                            // This could be lhs or part of it. For range, first expr_list is usually lhs vars.
+                            let mut lc = sub.walk();
+                            for v in sub.children(&mut lc) {
+                                if v.kind() == "identifier" || v.kind() == "blank_identifier" {
+                                    let nm = v.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                                    if !nm.is_empty() && nm != "_" {
+                                        lhs_vars.push(nm);
+                                    }
+                                }
+                            }
+                        } else if matches!(sub.kind(), "call_expression" | "selector_expression" | "identifier") {
+                            // Try to resolve type of the ranged-over expression
+                            let txt = sub.utf8_text(source.as_bytes()).unwrap_or("");
+                            if let Some(typ) = scope.get(txt).cloned()
+                                .or_else(|| package_level_vars.get(current_pkg).and_then(|m| m.get(txt)).cloned())
+                            {
+                                range_expr_type = Some(typ);
+                            } else if sub.kind() == "call_expression" {
+                                // General inference: resolve the call using our callee logic, then look up its return type(s)
+                                // in the return_map to get element type for the range variable. This is fully general.
+                                if let Some(fn_node) = sub.child_by_field_name("function") {
+                                    let cals = resolve_callee_node(fn_node, source, current_pkg, imports, module_name, method_index, interface_index, scope, package_level_vars);
+                                    for cal in cals {
+                                        if let Callee::Local(k) = cal {
+                                            if let Some(rets) = return_map.get(&k) {
+                                                for r in rets {
+                                                    if let Some(el) = element_type_of_container(r) {
+                                                        range_expr_type = Some(el);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !lhs_vars.is_empty() {
+                        if let Some(rt) = range_expr_type {
+                            if let Some(el) = element_type_of_container(&rt) {
+                                let norm_el = normalize_type(el, imports, current_pkg);
+                                for vname in &lhs_vars {
+                                    scope.insert(vname.clone(), norm_el.clone());
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+
             let mut loop_body = Vec::new();
             if let Some(b) = node.child_by_field_name("body") {
                 let mut c2 = b.walk();
@@ -1586,6 +1929,7 @@ fn process_node_for_body(
                         scope,
                         package_level_vars,
                         &mut loop_body,
+                        return_map,
                     );
                 }
             }
@@ -1606,14 +1950,33 @@ fn process_node_for_body(
                         package_level_vars,
                     );
                     let args = extract_call_args(call, source);
+                    let recv = extract_call_receiver(call, source);
                     for cal in cals {
                         elems.push(BodyElement::Call { info: CallInfo {
                             callee: cal,
                             goroutine: true,
                             args: args.clone(),
+                            receiver: recv.clone(),
                         }});
                     }
                 }
+            }
+            // Recurse into the go call's children to catch nested calls/func lits in args.
+            let mut c = node.walk();
+            for ch in node.children(&mut c) {
+                process_node_for_body(
+                    ch,
+                    source,
+                    current_pkg,
+                    imports,
+                    module_name,
+                    method_index,
+                    interface_index,
+                    scope,
+                    package_level_vars,
+                    elems,
+                    return_map,
+                );
             }
         }
         "call_expression" => {
@@ -1630,13 +1993,66 @@ fn process_node_for_body(
                     package_level_vars,
                 );
                 let args = extract_call_args(node, source);
+                let recv = extract_call_receiver(node, source);
                 for cal in cals {
                     elems.push(BodyElement::Call { info: CallInfo {
                         callee: cal,
                         goroutine: false,
                         args: args.clone(),
+                        receiver: recv.clone(),
                     }});
                 }
+            }
+            // Recurse into arguments (and other children) to surface nested calls
+            // and especially func literals (anonymous functions / callbacks) passed as args.
+            // This fixes tracing into e.g. foo(bar()) and map.Range(func(){...}).
+            let mut c = node.walk();
+            for ch in node.children(&mut c) {
+                process_node_for_body(
+                    ch,
+                    source,
+                    current_pkg,
+                    imports,
+                    module_name,
+                    method_index,
+                    interface_index,
+                    scope,
+                    package_level_vars,
+                    elems,
+                    return_map,
+                );
+            }
+        }
+        "send_statement" => {
+            let channel = node
+                .child_by_field_name("channel")
+                .map(|n| n.utf8_text(source.as_bytes()).unwrap_or("").to_string())
+                .unwrap_or_default();
+            let value = node
+                .child_by_field_name("value")
+                .map(|n| n.utf8_text(source.as_bytes()).unwrap_or("").to_string())
+                .unwrap_or_default();
+            if !channel.is_empty() {
+                let ch_node = node.child_by_field_name("channel");
+                let owner_type = resolve_channel_base_type(ch_node, source, current_pkg, imports, scope, package_level_vars);
+                elems.push(BodyElement::ChannelSend { channel, value, owner_type });
+            }
+            // Recurse in case of complex subexpr (though usually not needed for tracing)
+            let mut c = node.walk();
+            for ch in node.children(&mut c) {
+                process_node_for_body(
+                    ch,
+                    source,
+                    current_pkg,
+                    imports,
+                    module_name,
+                    method_index,
+                    interface_index,
+                    scope,
+                    package_level_vars,
+                    elems,
+                    return_map,
+                );
             }
         }
         "var_declaration" => {
@@ -1670,6 +2086,13 @@ fn process_node_for_body(
                             elems.push(BodyElement::Def { name: nm, rhs: rhs_text.clone() });
                         }
                     }
+                } else if ch.kind() == "var_spec_list" {
+                    let mut lc = ch.walk();
+                    for sub in ch.children(&mut lc) {
+                        if sub.kind() == "var_spec" {
+                            update_scope_from_var_spec(sub, source, current_pkg, imports, scope);
+                        }
+                    }
                 }
             }
             // Recurse to find calls inside the declaration expressions
@@ -1686,6 +2109,7 @@ fn process_node_for_body(
                     scope,
                     package_level_vars,
                     elems,
+                    return_map,
                 );
             }
         }
@@ -1738,7 +2162,94 @@ fn process_node_for_body(
                     scope,
                     package_level_vars,
                     elems,
+                    return_map,
                 );
+            }
+        }
+        "unary_expression" => {
+            // Detect channel receives like <-ch or in case x, ok := <-ch
+            let op_node = node.child_by_field_name("operator");
+            let op = op_node
+                .map(|n| n.utf8_text(source.as_bytes()).unwrap_or(""))
+                .unwrap_or("");
+            if op.trim() == "<-" {
+                let operand = node
+                    .child_by_field_name("operand")
+                    .map(|n| n.utf8_text(source.as_bytes()).unwrap_or("").to_string())
+                    .unwrap_or_default();
+                if !operand.is_empty() {
+                    let owner_type = resolve_channel_base_type(Some(node), source, current_pkg, imports, scope, package_level_vars);
+                    elems.push(BodyElement::ChannelRecv { channel: operand, target: None, owner_type });
+                }
+            }
+            let mut c = node.walk();
+            for ch in node.children(&mut c) {
+                process_node_for_body(
+                    ch,
+                    source,
+                    current_pkg,
+                    imports,
+                    module_name,
+                    method_index,
+                    interface_index,
+                    scope,
+                    package_level_vars,
+                    elems,
+                    return_map,
+                );
+            }
+        }
+        "func_literal" => {
+            let mut anon_scope = scope.clone();
+            // parse parameters of the anonymous func to support tracing inside it
+            if let Some(params_list) = node.child_by_field_name("parameters") {
+                for i in 0..params_list.child_count() {
+                    if let Some(param_decl) = params_list.child(i) {
+                        if param_decl.kind() == "parameter_declaration" {
+                            let mut var_names = vec![];
+                            let mut typ = String::new();
+                            for j in 0..param_decl.child_count() {
+                                if let Some(ch) = param_decl.child(j) {
+                                    match ch.kind() {
+                                        "identifier" => var_names.push(ch.utf8_text(source.as_bytes()).unwrap_or("").to_string()),
+                                        k if looks_like_type_node(k) || k == "pointer_type" => {
+                                            typ = ch.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            let norm_typ = if !typ.is_empty() {
+                                normalize_type(typ, imports, current_pkg)
+                            } else {
+                                String::new()
+                            };
+                            for vname in var_names {
+                                if !vname.is_empty() && !norm_typ.is_empty() {
+                                    anon_scope.insert(vname, norm_typ.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(body) = node.child_by_field_name("body") {
+                let sub_elems = extract_body_elements(
+                    body,
+                    source,
+                    current_pkg,
+                    imports,
+                    module_name,
+                    method_index,
+                    interface_index,
+                    &mut anon_scope,
+                    package_level_vars,
+                    return_map,
+                );
+                elems.push(BodyElement::Callback {
+                    name: None,
+                    body: sub_elems,
+                });
             }
         }
         _ => {
@@ -1757,6 +2268,7 @@ fn process_node_for_body(
                     scope,
                     package_level_vars,
                     elems,
+                    return_map,
                 );
             }
         }
@@ -1787,6 +2299,7 @@ fn populate_body_elements(
     package_level_vars: &HashMap<String, HashMap<String, String>>,
     graph: &mut CallGraph,
     params: &mut HashMap<FuncKey, Vec<String>>,
+    return_map: &HashMap<FuncKey, Vec<String>>,
 ) {
     match node.kind() {
         "function_declaration" | "method_declaration" => {
@@ -1817,6 +2330,7 @@ fn populate_body_elements(
                         interface_index,
                         &mut func_scope,
                         package_level_vars,
+                        return_map,
                     );
                     // Overwrite the (empty) entry from pass 1 with the structured body
                     graph.insert(key.clone(), elems);
@@ -1842,6 +2356,7 @@ fn populate_body_elements(
             package_level_vars,
             graph,
             params,
+            return_map,
         );
     }
 }
@@ -1989,6 +2504,13 @@ fn collect_decls_before(
             for ch in node.children(&mut cc) {
                 if ch.kind() == "var_spec" {
                     update_scope_from_var_spec(ch, source, current_pkg, imports, scope);
+                } else if ch.kind() == "var_spec_list" {
+                    let mut lc = ch.walk();
+                    for sub in ch.children(&mut lc) {
+                        if sub.kind() == "var_spec" {
+                            update_scope_from_var_spec(sub, source, current_pkg, imports, scope);
+                        }
+                    }
                 }
             }
         }
@@ -2105,6 +2627,12 @@ fn has_printable_content(elements: &[BodyElement]) -> bool {
                 }
             }
             BodyElement::Def { .. } => {} // internal for tracing, not printed
+            BodyElement::ChannelSend { .. } | BodyElement::ChannelRecv { .. } => return true,
+            BodyElement::Callback { body, .. } => {
+                if has_printable_content(body) {
+                    return true;
+                }
+            }
         }
     }
     false
@@ -2134,6 +2662,8 @@ fn print_body_elements(
             BodyElement::Call { .. } => true,
             BodyElement::Loop { body } => has_printable_content(body),
             BodyElement::Def { .. } => false,
+            BodyElement::ChannelSend { .. } | BodyElement::ChannelRecv { .. } => true,
+            BodyElement::Callback { body, .. } => has_printable_content(body),
         })
         .collect();
 
@@ -2146,6 +2676,21 @@ fn print_body_elements(
         let elem = *elem;
         match elem {
             BodyElement::Def { .. } => {} // should have been filtered
+            BodyElement::ChannelSend { channel, value, owner_type: _ } => {
+                let val = if value.is_empty() { "" } else { &format!(" <- {}", value) };
+                println!("{}{}[chan→ {}]{}", ind, prefix, channel, val);
+            }
+            BodyElement::ChannelRecv { channel, target, owner_type: _ } => {
+                let tgt = target.clone().unwrap_or_else(|| "_".to_string());
+                println!("{}{}[<- {}] → {}", ind, prefix, channel, tgt);
+            }
+            BodyElement::Callback { name, body } => {
+                let label = name.as_deref().unwrap_or("callback");
+                if has_printable_content(body) {
+                    println!("{}{}[callback {}]", ind, prefix, label);
+                    print_body_elements(body, graph, defs, depth + 1, path, expanded, loop_counter, max_depth);
+                }
+            }
             BodyElement::Call { info } => {
                 match &info.callee {
                     Callee::Local(child_key) => {
