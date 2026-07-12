@@ -152,6 +152,7 @@ function BodySequence({
   stack,
   initialTraced,
   goroutineLaunched,
+  hideNonLocal,
 }: {
   elems: BodyElement[]
   graphMap: Map<string, BodyElement[]>
@@ -163,6 +164,7 @@ function BodySequence({
   stack: Set<string>
   initialTraced: string[]
   goroutineLaunched?: Set<string>
+  hideNonLocal?: boolean
 }) {
   const nodes: React.ReactNode[] = []
   const live = new Set<string>(initialTraced || [])
@@ -196,6 +198,7 @@ function BodySequence({
           stack={stack}
           traced={Array.from(live)}
           goroutineLaunched={goroutineLaunched}
+          hideNonLocal={hideNonLocal}
         />
       )
       return
@@ -203,10 +206,14 @@ function BodySequence({
 
     if (elem.kind === 'Callback') {
       const children = elem.body ?? []
-      const hasContent = children.some((c: any) => 
-        c.kind === 'Call' || c.kind === 'Loop' || c.kind === 'Callback' || 
-        (c.kind === 'ChannelSend' || c.kind === 'ChannelRecv')
-      )
+      const hasContent = children.some((c: any) => {
+        if (c.kind === 'Call' && hideNonLocal && c.info) {
+          const k = describeCallee(c.info.callee).kind
+          if (k === 'external' || k === 'stdlib') return false
+        }
+        return c.kind === 'Call' || c.kind === 'Loop' || c.kind === 'Callback' || 
+          (c.kind === 'ChannelSend' || c.kind === 'ChannelRecv')
+      })
       if (hasContent) {
         nodes.push(
           <TreeNode
@@ -221,6 +228,7 @@ function BodySequence({
             stack={stack}
             traced={Array.from(live)}
             goroutineLaunched={goroutineLaunched}
+            hideNonLocal={hideNonLocal}
           />
         )
       }
@@ -241,12 +249,18 @@ function BodySequence({
           stack={stack}
           traced={Array.from(live)}
           goroutineLaunched={goroutineLaunched}
+          hideNonLocal={hideNonLocal}
         />
       )
       return
     }
 
     if (elem.kind === 'Call' && elem.info) {
+      const { kind } = describeCallee(elem.info.callee)
+      if (hideNonLocal && (kind === 'external' || kind === 'stdlib')) {
+        return // skip printing this call (user toggle)
+      }
+
       // Only names that are *actually passed* as arguments or receiver to *this* call.
       // This prevents showing unrelated live vars (like "er" or "code" from strings).
       const carriesHere = getPassedLiveNames(elem.info, Array.from(live))
@@ -265,6 +279,7 @@ function BodySequence({
           traced={Array.from(live)}
           carries={carriesHere}
           goroutineLaunched={goroutineLaunched}
+          hideNonLocal={hideNonLocal}
         />
       )
       return
@@ -290,6 +305,7 @@ function TreeNode({
   traced,
   carries,
   goroutineLaunched,
+  hideNonLocal,
 }: {
   elem: BodyElement
   graphMap: Map<string, BodyElement[]>
@@ -302,16 +318,21 @@ function TreeNode({
   traced?: string[]
   carries?: string[]
   goroutineLaunched?: Set<string>
+  hideNonLocal?: boolean
 }) {
   const open = expanded.has(path)
 
   /* ---- Callback (anonymous func passed to higher-order func) ---- */
   if (elem.kind === 'Callback') {
     const children = elem.body ?? []
-    const hasContent = children.some((c: any) => 
-      c.kind === 'Call' || c.kind === 'Loop' || c.kind === 'Callback' || 
-      (c.kind === 'ChannelSend' || c.kind === 'ChannelRecv')
-    )
+    const hasContent = children.some((c: any) => {
+      if (c.kind === 'Call' && hideNonLocal && c.info) {
+        const k = describeCallee(c.info.callee).kind
+        if (k === 'external' || k === 'stdlib') return false
+      }
+      return c.kind === 'Call' || c.kind === 'Loop' || c.kind === 'Callback' || 
+        (c.kind === 'ChannelSend' || c.kind === 'ChannelRecv')
+    })
     if (!hasContent) return null
     const cbName = elem.name || 'callback'
     return (
@@ -340,6 +361,7 @@ function TreeNode({
               stack={stack}
               initialTraced={traced || []}
               goroutineLaunched={goroutineLaunched}
+              hideNonLocal={hideNonLocal}
             />
           </div>
         )}
@@ -484,6 +506,7 @@ function TreeNode({
               stack={stack}
               initialTraced={traced || []}
               goroutineLaunched={goroutineLaunched || new Set()}
+              hideNonLocal={hideNonLocal}
             />
           </div>
         )}
@@ -495,6 +518,10 @@ function TreeNode({
   if (elem.kind === 'Call' && elem.info) {
     const info = elem.info
     const { kind, pkg, recv, label, key } = describeCallee(info.callee)
+
+    if (hideNonLocal && (kind === 'external' || kind === 'stdlib')) {
+      return null // respect the hide toggle
+    }
 
     const keyStr = key ? JSON.stringify(key) : null
     const subBody = keyStr ? graphMap.get(keyStr) : undefined
@@ -570,6 +597,7 @@ function TreeNode({
               stack={nextStack}
               initialTraced={childInitialTraced || []}
               goroutineLaunched={goroutineLaunched || new Set()}
+              hideNonLocal={hideNonLocal}
             />
           </div>
         )}
@@ -684,6 +712,7 @@ function App() {
   const [data, setData] = useState<AnalysisPayload | null>(null)
   const [conn, setConn] = useState<ConnState>('connecting')
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const [hideNonLocal, setHideNonLocal] = useState(false)  // toggle to hide stdlib + external calls
 
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -786,6 +815,14 @@ function App() {
           <div className="controls">
             <button className="btn" onClick={expandAll}>Expand all</button>
             <button className="btn" onClick={collapseAll}>Collapse all</button>
+            <label className="filter-toggle" title="Hide stdlib and external calls from the tree (keeps local structure and traced params)">
+              <input
+                type="checkbox"
+                checked={hideNonLocal}
+                onChange={(e) => setHideNonLocal(e.target.checked)}
+              />
+              <span>Hide stdlib/external</span>
+            </label>
           </div>
 
           <div className="stats">
@@ -832,6 +869,7 @@ function App() {
               stack={new Set()}
               initialTraced={rootParams}
               goroutineLaunched={goroutineLaunched || new Set()}
+              hideNonLocal={hideNonLocal}
             />
           </div>
         ) : (
