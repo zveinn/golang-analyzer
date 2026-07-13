@@ -7,14 +7,15 @@ import (
 	"go/types"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/types/typeutil"
 )
 
 const (
-	maxDepth = 40
-	maxNodes = 200000
+	defaultMaxDepth = 40
+	maxNodes        = 200000
 )
 
 type analyzer struct {
@@ -40,6 +41,11 @@ type analyzer struct {
 	litDepth  int
 	nodeCount int
 	truncated bool
+
+	// maxDepth and expandAll are tunable per request ("depth" and "expand"
+	// parameters on the TCP intake).
+	maxDepth  int
+	expandAll bool
 
 	// expandedAt records where each function body was first expanded in the
 	// trace; later call sites reference it instead of re-printing the body,
@@ -78,6 +84,7 @@ func newAnalyzer(absFile string) (*analyzer, error) {
 		aliasParent:  map[any]any{},
 		expandedAt:   map[*types.Func]string{},
 		expandedLits: map[*ast.FuncLit]string{},
+		maxDepth:     defaultMaxDepth,
 		cwd:          cwd,
 	}
 	cfg := &packages.Config{
@@ -110,6 +117,32 @@ func newAnalyzer(absFile string) (*analyzer, error) {
 	}
 	a.buildIndexes()
 	return a, nil
+}
+
+// applyParams applies request parameters received on the TCP intake.
+func (a *analyzer) applyParams(params map[string]string) error {
+	for k, v := range params {
+		switch k {
+		case "depth":
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 {
+				return fmt.Errorf("invalid depth %q (want a positive integer)", v)
+			}
+			a.maxDepth = n
+		case "expand":
+			switch v {
+			case "all":
+				a.expandAll = true
+			case "once":
+				a.expandAll = false
+			default:
+				return fmt.Errorf(`invalid expand %q (want "all" or "once")`, v)
+			}
+		default:
+			return fmt.Errorf("unknown parameter %q (supported: depth, expand)", k)
+		}
+	}
+	return nil
 }
 
 func findModuleRoot(dir string) (string, error) {

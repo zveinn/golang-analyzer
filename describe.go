@@ -57,16 +57,20 @@ func (a *analyzer) annotateArg(p *packages.Package, arg ast.Expr, parent *node) 
 		switch obj := p.TypesInfo.Uses[x].(type) {
 		case *types.Var:
 			if desc, at, ok := a.describeVarOrigin(obj); ok {
-				parent.addp(at, "arg %s%s ← %s", prefix, x.Name, desc)
+				parent.add(&node{Pos: at, Kind: "arg",
+					Text: prefix + x.Name + " ← " + desc})
 			}
 		case *types.Func:
-			parent.addp(a.relPos(obj.Pos()), "arg %s ← function reference [%s]", x.Name, a.classify(obj.Pkg()))
+			parent.add(&node{Pos: a.relPos(obj.Pos()), Kind: "arg", Label: a.classify(obj.Pkg()),
+				Text: x.Name + " ← function reference"})
 		}
 	case *ast.FuncLit:
-		parent.addp(a.relPos(x.Pos()), "arg %sfunc{…} ← function literal", prefix)
+		parent.add(&node{Pos: a.relPos(x.Pos()), Kind: "arg",
+			Text: prefix + "func{…} ← function literal"})
 	case *ast.SelectorExpr:
 		if sel, ok := p.TypesInfo.Selections[x]; ok && sel.Kind() == types.FieldVal {
-			parent.addp(a.relPos(sel.Obj().Pos()), "arg %s%s ← struct field %s", prefix, exprStr(x), sel.Obj().Name())
+			parent.add(&node{Pos: a.relPos(sel.Obj().Pos()), Kind: "arg",
+				Text: prefix + exprStr(x) + " ← struct field " + sel.Obj().Name()})
 		}
 	}
 }

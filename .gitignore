@@ -1,10 +1,12 @@
-/target
-**/*.rs.bk
-Cargo.lock
+# binaries
+/code-analyzer
+/client/client
+
+# UI build artifacts (ui/dist is embedded via go:embed — rebuild with `npm run build`)
+ui/node_modules/
+
 *.log
-# Go test data (we may generate some)
-/testdata
-/client/target/
+
 # Editor
 .idea/
 .vscode/

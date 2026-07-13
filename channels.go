@@ -155,20 +155,20 @@ func (a *analyzer) chanPeers(key any, kind chanOpKind, selfPos token.Pos) []chan
 // chanEvent emits a trace node for a channel operation, listing the
 // opposite endpoints found anywhere in the module.
 func (a *analyzer) chanEvent(p *packages.Package, kind chanOpKind, ch ast.Expr, valText string, pos token.Pos, parent *node) {
-	var text string
+	var nodeKind, text string
 	switch kind {
 	case chanSend:
-		text = exprStr(ch) + " <- " + valText + "  [CHAN SEND]"
+		nodeKind, text = "chan-send", exprStr(ch)+" <- "+valText
 	case chanRecv:
-		text = "<-" + exprStr(ch) + "  [CHAN RECV]"
+		nodeKind, text = "chan-recv", "<-"+exprStr(ch)
 	case chanClose:
-		text = "close(" + exprStr(ch) + ")  [CHAN CLOSE]"
+		nodeKind, text = "chan-close", "close("+exprStr(ch)+")"
 	}
-	n := parent.add(&node{pos: a.relPos(pos), text: text})
+	n := parent.add(&node{Pos: a.relPos(pos), Kind: nodeKind, Text: text})
 
 	key := a.chanKey(p.TypesInfo, ch)
 	if key == nil {
-		n.addf("↳ peers unknown (dynamic channel expression)")
+		n.note("peers unknown (dynamic channel expression)")
 		return
 	}
 	peers := a.chanPeers(key, kind, pos)
@@ -177,7 +177,7 @@ func (a *analyzer) chanEvent(p *packages.Package, kind chanOpKind, ch ast.Expr, 
 		if kind == chanRecv {
 			role = "writers"
 		}
-		n.addf("↳ no %s found in module", role)
+		n.note("no %s found in module", role)
 		return
 	}
 	for _, peer := range peers {
@@ -190,6 +190,6 @@ func (a *analyzer) chanEvent(p *packages.Package, kind chanOpKind, ch ast.Expr, 
 		default:
 			role = "reader"
 		}
-		n.addp(a.relPos(peer.pos), "↳ %s: %s", role, peer.fn)
+		n.add(&node{Pos: a.relPos(peer.pos), Kind: "peer", Text: role + ": " + peer.fn})
 	}
 }

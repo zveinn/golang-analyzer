@@ -4,50 +4,54 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 )
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `usage: %s <file.go> <line>
+	fmt.Fprintf(os.Stderr, `usage: %[1]s
 
-Traces all execution paths of the function declared at <file.go>:<line>.
+Starts the code-analyzer server:
+  - web UI on http://%[2]s
+  - TCP intake on %[3]s accepting "file:line[:param:value]..." requests
 
-Labels:
-  [local]   function defined in the target file's module (traced into)
-  [stdlib]  Go standard library (not traced into)
-  [module]  external dependency (not traced into)
+Analysis is triggered exclusively via the TCP intake — use ./client:
+  ./client <file.go> <line> [param value]...
 
-Trace markers:
-  [GOROUTINE LAUNCH]  a goroutine is started
-  [LOOP N]            calls inside are executed in a loop
-  [CHAN SEND/RECV/CLOSE] channel operation, with opposite endpoints listed
-  arg x ← …           where a call argument was allocated / produced
-`, filepath.Base(os.Args[0]))
+Parameters:
+  depth  <n>          max call-expansion depth (default %[4]d)
+  expand once|all     expand each function body once (default) or at
+                      every call site
+`, filepath.Base(os.Args[0]), uiAddr, tcpAddr, defaultMaxDepth)
 	os.Exit(2)
 }
 
 func main() {
-	if len(os.Args) != 3 {
+	if len(os.Args) != 1 {
 		usage()
 	}
-	file, err := filepath.Abs(os.Args[1])
-	if err != nil {
+	if err := runServer(); err != nil {
 		fatal(err)
 	}
-	line, err := strconv.Atoi(os.Args[2])
-	if err != nil || line < 1 {
-		fmt.Fprintf(os.Stderr, "invalid line number %q\n", os.Args[2])
-		os.Exit(2)
-	}
-	a, err := newAnalyzer(file)
+}
+
+// runTrace analyzes the function at path:line and returns the structured
+// trace tree. Called only from the TCP intake.
+func runTrace(path string, line int, params map[string]string) (*node, error) {
+	abs, err := filepath.Abs(path)
 	if err != nil {
-		fatal(err)
+		return nil, err
 	}
-	t, err := a.findFunc(file, line)
+	a, err := newAnalyzer(abs)
 	if err != nil {
-		fatal(err)
+		return nil, err
 	}
-	render(os.Stdout, a.trace(t))
+	if err := a.applyParams(params); err != nil {
+		return nil, err
+	}
+	t, err := a.findFunc(abs, line)
+	if err != nil {
+		return nil, err
+	}
+	return a.trace(t), nil
 }
 
 func fatal(err error) {

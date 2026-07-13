@@ -1,55 +1,87 @@
 # code-analyzer
 
 Static execution-path tracer for Go. Point it at a function declaration and it
-prints every possible execution path as an indented call tree, including
+traces every possible execution path as an indented call tree, including
 goroutine launches, loops, channel endpoints and where call arguments were
-allocated.
+allocated. Traces are displayed in a web UI (embedded React app), or on
+stdout in CLI mode.
+
+## Build & run
+
+```
+$ ./build-and-run.sh
+```
+
+This builds the UI (`ui/dist`, embedded via go:embed), the backend and the
+TCP client, stops a previously running instance, and starts the server.
+Manual steps, if you prefer:
+
+```
+$ cd ui && npm install && npm run build && cd ..   # builds ui/dist (embedded via go:embed)
+$ go build -o code-analyzer .                      # server
+$ go build -o client/client ./client               # TCP client
+```
 
 ## Usage
 
 ```
-$ go build -o code-analyzer .
-$ ./code-analyzer <file.go> <line>
+$ ./code-analyzer                # UI on http://0.0.0.0:1111, TCP intake on :1112
+$ ./client/client <file.go> <line> [param value]...
+$ ./client/client examples/main.go 36 depth 10 expand all
 ```
 
-`<line>` may be any line inside the target function's declaration.
+Analysis is triggered exclusively through the TCP intake on **:1112**, which
+accepts requests in the format `file:line[:param:value]...` (the client
+builds this string for you and absolutizes the path; `<line>` may be any
+line inside the target function's declaration). Each request is analyzed in
+the backend and the resulting **structured trace tree** is pushed as JSON to
+the React UI on **:1111** over a websocket. New UI connections get the last
+50 results replayed.
 
-Positions are printed in a fixed left gutter; the call tree is indented to
-the right of it. Annotation lines (`↳ …`, `arg …`) carry the position they
-refer to (peer endpoint, allocation site, first expansion).
+The UI is a trace inspector: a sidebar of received traces, and a collapsible
+tree with the source position of every entry in a left gutter, kind badges
+(goroutine launches, loops, channel ops, interface dispatch, …),
+local/stdlib/module chips, live text filtering, and expand/collapse-all.
+It renders the backend's tree verbatim — no code analysis happens
+client-side, the UI only maps backend-provided node kinds to styling.
 
+Supported parameters:
+
+| param | values | meaning |
+| --- | --- | --- |
+| `depth` | positive integer | max call-expansion depth (default 40) |
+| `expand` | `once` (default) / `all` | expand each function body once per trace, or at every call site |
+
+## Wire format
+
+Each websocket message is one envelope:
+
+```json
+{"type": "trace", "target": "/abs/path/main.go:36", "params": {"depth": "6"},
+ "time": "12:36:30", "root": { ...node... }}
+{"type": "error", "target": "...", "time": "...", "text": "message"}
 ```
-$ ./code-analyzer examples/main.go 36
-examples/main.go:36    │ func Run(ctx context.Context, cfg *Config) [local]
-examples/main.go:37    │   main.NewPool(cfg.Workers) [local]
-examples/main.go:14    │     arg cfg.Workers ← struct field Workers
-examples/main.go:40    │   [LOOP 1] for i < cfg.Workers
-examples/main.go:42    │     [GOROUTINE LAUNCH] go pool.worker(…)
-examples/main.go:42    │       (*main.Pool).worker(ctx, &wg, i) [local]
-...
-examples/main.go:67    │         select
-examples/main.go:68    │             case job, ok := <-p.jobs:
-examples/main.go:68    │               <-p.jobs  [CHAN RECV]
-examples/main.go:84    │                 ↳ writer: main.produce
-examples/main.go:86    │                 ↳ closed by: main.produce
-```
 
-## Output vocabulary
+A node is `{pos, kind, label, num, text, kids}` where `kind` is one of:
+`root`, `call`, `interface-call`, `func-value-call`, `indirect-call`,
+`impl`, `bound`, `go`, `defer`, `loop` (with `num`), `branch`, `case`,
+`select`, `chan-send`, `chan-recv`, `chan-close`, `peer`, `arg`, `note`;
+`label` classifies callees as `local`/`stdlib`/`module`.
 
-| Marker | Meaning |
+## Trace vocabulary
+
+| Node kind | Meaning |
 | --- | --- |
-| `[local]` | function defined in the target module — traced into |
-| `[stdlib]` | Go standard library — labeled, never traced into |
-| `[module]` | external dependency — labeled, never traced into |
-| `[LOOP N]` | calls underneath execute inside a loop (numbered in trace order) |
-| `[GOROUTINE LAUNCH]` | a goroutine is started here |
-| `[CHAN SEND/RECV/CLOSE]` | channel operation; the opposite endpoints (writers/readers/closers) found anywhere in the module are listed under it |
-| `[interface method, …]` | dynamic dispatch; every implementation in the module is listed and local ones are traced |
-| `[func value]` | call through a function-typed variable; the bound literal/function is resolved when statically possible |
-| `[defer]` | deferred call (runs at function exit) |
-| `arg x ← …` | where a call argument was allocated or produced (`make`, `&T{…}`, parameter, call result, range variable, …) |
-| `if … / else / case …` | branch context — all paths are traced |
-| `↳ body already traced @ …` | this function's body was expanded earlier in the trace (at the given call site); it is not re-printed |
+| `call` + label | a resolved call; `local` callees are traced into, `stdlib`/`module` are labeled only |
+| `loop` (`num`) | calls underneath execute inside a loop (numbered in trace order) |
+| `go` | a goroutine is started here |
+| `chan-send` / `chan-recv` / `chan-close` | channel operation; `peer` children list the opposite endpoints (writers/readers/closers) found anywhere in the module |
+| `interface-call` + `impl` | dynamic dispatch; every implementation in the module is listed and local ones are traced |
+| `func-value-call` + `bound` | call through a function-typed variable; the bound literal/function is resolved when statically possible |
+| `defer` | deferred call (runs at function exit) |
+| `arg` | where a call argument was allocated or produced (`make`, `&T{…}`, parameter, call result, range variable, …); `pos` points at the allocation site |
+| `branch` / `case` / `select` | control-flow context — all paths are traced |
+| `note` | recursion cut-offs, "body already traced" references (`pos` points at the first expansion), missing peers, depth limits |
 
 ## How it works
 

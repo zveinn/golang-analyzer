@@ -13,8 +13,12 @@ import (
 
 // trace walks the target function and produces the execution trace tree.
 func (a *analyzer) trace(t *target) *node {
-	root := &node{pos: a.relPos(t.def.decl.Pos()),
-		text: types.ObjectString(t.fn, types.RelativeTo(t.fn.Pkg())) + " [local]"}
+	root := &node{
+		Pos:   a.relPos(t.def.decl.Pos()),
+		Kind:  "root",
+		Label: "local",
+		Text:  types.ObjectString(t.fn, types.RelativeTo(t.fn.Pkg())),
+	}
 	a.expandedAt[t.fn.Origin()] = a.relPos(t.def.decl.Pos())
 	a.stack = append(a.stack, t.fn.Origin())
 	a.block(t.def.pkg, t.def.decl.Body, root)
@@ -23,7 +27,7 @@ func (a *analyzer) trace(t *target) *node {
 	var loops int
 	numberLoops(root, &loops)
 	if a.truncated {
-		root.addf("… trace truncated (node limit %d reached)", maxNodes)
+		root.note("… trace truncated (node limit %d reached)", maxNodes)
 	}
 	return root
 }
@@ -66,21 +70,21 @@ func (a *analyzer) stmt(p *packages.Package, s ast.Stmt, parent *node) {
 		if _, ok := ast.Unparen(x.Call.Fun).(*ast.FuncLit); ok {
 			name = "func literal"
 		}
-		gn := parent.addp(a.relPos(x.Pos()), "[GOROUTINE LAUNCH] go %s(…)", name)
+		gn := parent.add(&node{Pos: a.relPos(x.Pos()), Kind: "go", Text: "go " + name + "(…)"})
 		a.call(p, x.Call, gn)
 	case *ast.DeferStmt:
-		dn := parent.add(&node{pos: a.relPos(x.Pos()), text: "[defer]", structural: true})
+		dn := parent.add(&node{Pos: a.relPos(x.Pos()), Kind: "defer", Text: "defer", structural: true})
 		a.call(p, x.Call, dn)
 	case *ast.SendStmt:
 		a.expr(p, x.Value, parent)
 		a.chanEvent(p, chanSend, x.Chan, exprStr(x.Value), x.Arrow, parent)
 	case *ast.IfStmt:
 		a.stmt(p, x.Init, parent)
-		in := parent.add(&node{pos: a.relPos(x.If), text: "if " + exprStr(x.Cond), structural: true})
+		in := parent.add(&node{Pos: a.relPos(x.If), Kind: "branch", Text: "if " + exprStr(x.Cond), structural: true})
 		a.expr(p, x.Cond, in)
 		a.block(p, x.Body, in)
 		if x.Else != nil {
-			en := parent.add(&node{pos: a.relPos(x.Else.Pos()), text: "else", structural: true})
+			en := parent.add(&node{Pos: a.relPos(x.Else.Pos()), Kind: "branch", Text: "else", structural: true})
 			a.stmt(p, x.Else, en)
 		}
 	case *ast.BlockStmt:
@@ -91,13 +95,13 @@ func (a *analyzer) stmt(p *packages.Package, s ast.Stmt, parent *node) {
 		if x.Cond != nil {
 			hdr = "for " + exprStr(x.Cond)
 		}
-		ln := parent.add(&node{pos: a.relPos(x.For), text: "[LOOP %d] " + hdr, structural: true, loop: true})
+		ln := parent.add(&node{Pos: a.relPos(x.For), Kind: "loop", Text: hdr, structural: true, loop: true})
 		a.expr(p, x.Cond, ln)
 		a.block(p, x.Body, ln)
 		a.stmt(p, x.Post, ln)
 	case *ast.RangeStmt:
 		a.expr(p, x.X, parent) // range expression is evaluated once, before the loop
-		ln := parent.add(&node{pos: a.relPos(x.For), text: "[LOOP %d] for range " + exprStr(x.X), structural: true, loop: true})
+		ln := parent.add(&node{Pos: a.relPos(x.For), Kind: "loop", Text: "for range " + exprStr(x.X), structural: true, loop: true})
 		if isChanType(p.TypesInfo.TypeOf(x.X)) {
 			a.chanEvent(p, chanRecv, x.X, "", x.For, ln)
 		}
@@ -108,23 +112,23 @@ func (a *analyzer) stmt(p *packages.Package, s ast.Stmt, parent *node) {
 		if x.Tag != nil {
 			hdr += " " + exprStr(x.Tag)
 		}
-		sn := parent.add(&node{pos: a.relPos(x.Switch), text: hdr, structural: true})
+		sn := parent.add(&node{Pos: a.relPos(x.Switch), Kind: "branch", Text: hdr, structural: true})
 		a.expr(p, x.Tag, sn)
 		a.caseClauses(p, x.Body, sn)
 	case *ast.TypeSwitchStmt:
 		a.stmt(p, x.Init, parent)
-		sn := parent.add(&node{pos: a.relPos(x.Switch), text: "type switch", structural: true})
+		sn := parent.add(&node{Pos: a.relPos(x.Switch), Kind: "branch", Text: "type switch", structural: true})
 		a.stmt(p, x.Assign, sn)
 		a.caseClauses(p, x.Body, sn)
 	case *ast.SelectStmt:
-		sn := parent.add(&node{pos: a.relPos(x.Pos()), text: "select", structural: true})
+		sn := parent.add(&node{Pos: a.relPos(x.Pos()), Kind: "select", Text: "select", structural: true})
 		for _, c := range x.Body.List {
 			cc := c.(*ast.CommClause)
-			text := "case default:"
+			text := "default:"
 			if cc.Comm != nil {
 				text = "case " + commText(cc.Comm) + ":"
 			}
-			cn := sn.add(&node{pos: a.relPos(cc.Case), text: text, structural: true})
+			cn := sn.add(&node{Pos: a.relPos(cc.Case), Kind: "case", Text: text, structural: true})
 			a.stmt(p, cc.Comm, cn)
 			for _, bs := range cc.Body {
 				a.stmt(p, bs, cn)
@@ -157,7 +161,7 @@ func (a *analyzer) caseClauses(p *packages.Package, body *ast.BlockStmt, parent 
 		if !ok {
 			continue
 		}
-		cn := parent.add(&node{pos: a.relPos(cc.Case), text: caseText(cc.List), structural: true})
+		cn := parent.add(&node{Pos: a.relPos(cc.Case), Kind: "case", Text: caseText(cc.List), structural: true})
 		for _, e := range cc.List {
 			a.expr(p, e, cn)
 		}
@@ -257,7 +261,7 @@ func (a *analyzer) call(p *packages.Package, call *ast.CallExpr, parent *node) {
 
 	// Immediately-invoked function literal: func(){...}()
 	if lit, ok := fun.(*ast.FuncLit); ok {
-		n := parent.addp(a.relPos(call.Lparen), "func literal() [local]")
+		n := parent.add(&node{Pos: a.relPos(call.Lparen), Kind: "call", Label: "local", Text: "func literal()"})
 		a.walkArgs(p, call, n)
 		a.expandLit(p, lit, a.relPos(call.Lparen), n)
 		return
@@ -279,8 +283,8 @@ func (a *analyzer) call(p *packages.Package, call *ast.CallExpr, parent *node) {
 	case *types.Var:
 		a.funcValueCall(p, call, callee, parent)
 	default:
-		n := parent.addp(a.relPos(call.Lparen), "%s(%s) [indirect — dynamic callee]",
-			exprStr(call.Fun), argList(call))
+		n := parent.add(&node{Pos: a.relPos(call.Lparen), Kind: "indirect-call",
+			Text: exprStr(call.Fun) + "(" + argList(call) + ")"})
 		a.expr(p, call.Fun, n)
 		a.walkArgs(p, call, n)
 	}
@@ -293,8 +297,8 @@ func (a *analyzer) staticCall(p *packages.Package, call *ast.CallExpr, fn *types
 		return
 	}
 	label := a.classify(fn.Pkg())
-	n := parent.addp(a.relPos(call.Lparen), "%s%s(%s) [%s]",
-		funcDisplayName(fn), a.instanceSuffix(p, call), argList(call), label)
+	n := parent.add(&node{Pos: a.relPos(call.Lparen), Kind: "call", Label: label,
+		Text: funcDisplayName(fn) + a.instanceSuffix(p, call) + "(" + argList(call) + ")"})
 	if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok {
 		a.expr(p, sel.X, n) // receiver expression may itself contain calls
 	}
@@ -307,8 +311,8 @@ func (a *analyzer) staticCall(p *packages.Package, call *ast.CallExpr, fn *types
 // listed (and traced, when local).
 func (a *analyzer) interfaceCall(p *packages.Package, call *ast.CallExpr, fn *types.Func, parent *node) {
 	label := a.classify(fn.Pkg())
-	n := parent.addp(a.relPos(call.Lparen), "%s(%s) [interface method, %s]",
-		exprStr(call.Fun), argList(call), label)
+	n := parent.add(&node{Pos: a.relPos(call.Lparen), Kind: "interface-call", Label: label,
+		Text: exprStr(call.Fun) + "(" + argList(call) + ")"})
 	if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok {
 		a.expr(p, sel.X, n)
 	}
@@ -319,22 +323,23 @@ func (a *analyzer) interfaceCall(p *packages.Package, call *ast.CallExpr, fn *ty
 		return
 	}
 	if types.Identical(iface, types.Universe.Lookup("error").Type().Underlying()) {
-		n.addf("↳ error interface — implementations not enumerated")
+		n.note("error interface — implementations not enumerated")
 		return
 	}
 	impls := a.implementations(iface, fn.Name())
 	if len(impls) == 0 {
-		n.addf("↳ no implementations found in module")
+		n.note("no implementations found in module")
 		return
 	}
 	const maxImpls = 8
 	for i, impl := range impls {
 		if i == maxImpls {
-			n.addf("↳ … and %d more implementations", len(impls)-maxImpls)
+			n.note("… and %d more implementations", len(impls)-maxImpls)
 			break
 		}
 		lbl := a.classify(impl.Pkg())
-		in := n.addp(a.relPos(impl.Pos()), "↳ possible impl: %s [%s]", funcDisplayName(impl), lbl)
+		in := n.add(&node{Pos: a.relPos(impl.Pos()), Kind: "impl", Label: lbl,
+			Text: "possible impl: " + funcDisplayName(impl)})
 		a.expand(impl, lbl, a.relPos(call.Lparen), in)
 	}
 }
@@ -365,43 +370,45 @@ func (a *analyzer) implementations(iface *types.Interface, method string) []*typ
 
 // funcValueCall handles calling through a variable of function type.
 func (a *analyzer) funcValueCall(p *packages.Package, call *ast.CallExpr, v *types.Var, parent *node) {
-	n := parent.addp(a.relPos(call.Lparen), "%s(%s) [func value]", exprStr(call.Fun), argList(call))
+	n := parent.add(&node{Pos: a.relPos(call.Lparen), Kind: "func-value-call",
+		Text: exprStr(call.Fun) + "(" + argList(call) + ")"})
 	a.walkArgs(p, call, n)
 	site, ok := a.defs[v]
 	if !ok {
-		n.addf("↳ callee unknown at analysis time")
+		n.note("callee unknown at analysis time")
 		return
 	}
 	switch d := site.node.(type) {
 	case *ast.Field:
-		n.addf("↳ func parameter %q of %s — concrete callee depends on caller",
+		n.note("func parameter %q of %s — concrete callee depends on caller",
 			v.Name(), a.enclosingFuncName(site.pkg, site.file, site.node.Pos()))
 		return
 	case *ast.AssignStmt, *ast.ValueSpec:
 		_ = d
 	default:
-		n.addf("↳ callee unknown at analysis time")
+		n.note("callee unknown at analysis time")
 		return
 	}
 	rhs := rhsForVar(site, v)
 	if rhs == nil {
-		n.addp(a.relPos(site.node.Pos()), "↳ bound here — concrete callee not statically known")
+		n.notep(a.relPos(site.node.Pos()), "bound here — concrete callee not statically known")
 		return
 	}
 	switch r := ast.Unparen(rhs).(type) {
 	case *ast.FuncLit:
-		ln := n.addp(a.relPos(r.Pos()), "↳ bound to func literal")
+		ln := n.add(&node{Pos: a.relPos(r.Pos()), Kind: "bound", Label: "local", Text: "bound to func literal"})
 		a.expandLit(site.pkg, r, a.relPos(call.Lparen), ln)
 	case *ast.Ident, *ast.SelectorExpr:
 		if fn, ok := exprObj(site.pkg.TypesInfo, r).(*types.Func); ok {
 			lbl := a.classify(fn.Pkg())
-			in := n.addp(a.relPos(fn.Pos()), "↳ bound to %s [%s]", funcDisplayName(fn), lbl)
+			in := n.add(&node{Pos: a.relPos(fn.Pos()), Kind: "bound", Label: lbl,
+				Text: "bound to " + funcDisplayName(fn)})
 			a.expand(fn, lbl, a.relPos(call.Lparen), in)
 			return
 		}
-		n.addp(a.relPos(site.node.Pos()), "↳ bound to %s — not statically resolvable", exprStr(rhs))
+		n.notep(a.relPos(site.node.Pos()), "bound to %s — not statically resolvable", exprStr(rhs))
 	default:
-		n.addp(a.relPos(site.node.Pos()), "↳ bound to %s — not statically resolvable", exprStr(rhs))
+		n.notep(a.relPos(site.node.Pos()), "bound to %s — not statically resolvable", exprStr(rhs))
 	}
 }
 
@@ -458,15 +465,15 @@ func (a *analyzer) expand(fn *types.Func, label string, at string, n *node) {
 		return
 	}
 	if slices.Contains(a.stack, origin) {
-		n.addf("[recursive — already in call stack, not expanding]")
+		n.note("recursive — already in call stack, not expanding")
 		return
 	}
-	if first, done := a.expandedAt[origin]; done {
-		n.addp(first, "↳ body already traced (at first call site)")
+	if first, done := a.expandedAt[origin]; done && !a.expandAll {
+		n.notep(first, "body already traced (at first call site)")
 		return
 	}
-	if len(a.stack) >= maxDepth {
-		n.addf("… depth limit (%d) reached", maxDepth)
+	if len(a.stack) >= a.maxDepth {
+		n.note("… depth limit (%d) reached", a.maxDepth)
 		return
 	}
 	a.expandedAt[origin] = at
@@ -478,12 +485,12 @@ func (a *analyzer) expand(fn *types.Func, label string, at string, n *node) {
 // expandLit traces a function literal's body with depth protection
 // (literals aren't on the named-function cycle stack).
 func (a *analyzer) expandLit(p *packages.Package, lit *ast.FuncLit, at string, n *node) {
-	if first, done := a.expandedLits[lit]; done {
-		n.addp(first, "↳ body already traced (at first call site)")
+	if first, done := a.expandedLits[lit]; done && !a.expandAll {
+		n.notep(first, "body already traced (at first call site)")
 		return
 	}
-	if len(a.stack)+a.litDepth >= maxDepth {
-		n.addf("… depth limit (%d) reached", maxDepth)
+	if len(a.stack)+a.litDepth >= a.maxDepth {
+		n.note("… depth limit (%d) reached", a.maxDepth)
 		return
 	}
 	a.expandedLits[lit] = at

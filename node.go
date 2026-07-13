@@ -1,84 +1,67 @@
 package main
 
-import (
-	"fmt"
-	"io"
-	"strings"
-)
+import "fmt"
 
-// node is one entry in the execution trace tree.
+// node is one entry in the execution trace tree. It serializes directly to
+// JSON for the UI, which renders it without further interpretation — every
+// semantic decision (kind, label, position) is made here in the backend.
 type node struct {
-	// pos is the file:line this entry points at, printed in the left
-	// gutter; empty for annotation lines with no location of their own.
-	pos  string
-	text string
+	// Pos is the file:line this entry points at; empty for lines with no
+	// location of their own.
+	Pos string `json:"pos,omitempty"`
+	// Kind tells the UI what this entry is:
+	//   root | call | interface-call | func-value-call | indirect-call |
+	//   impl | bound | go | defer | loop | branch | case | select |
+	//   chan-send | chan-recv | chan-close | peer | arg | note
+	Kind string `json:"kind,omitempty"`
+	// Label classifies a callee: local | stdlib | module | builtin.
+	Label string `json:"label,omitempty"`
+	// Num is the loop number (kind "loop"), assigned after pruning.
+	Num  int     `json:"num,omitempty"`
+	Text string  `json:"text"`
+	Kids []*node `json:"kids,omitempty"`
+
 	// structural nodes (loops, branches, select) are pruned when they end
 	// up with no children, since they carry no calls or channel activity.
 	structural bool
-	// loop nodes carry a "%d" placeholder in text; numbers are assigned
-	// after pruning so they stay contiguous.
-	loop bool
-	kids []*node
+	loop       bool
 }
 
 func (n *node) add(k *node) *node {
-	n.kids = append(n.kids, k)
+	n.Kids = append(n.Kids, k)
 	return k
 }
 
-func (n *node) addf(format string, args ...any) *node {
-	return n.add(&node{text: fmt.Sprintf(format, args...)})
+// note adds a plain informational child without a source position.
+func (n *node) note(format string, args ...any) *node {
+	return n.add(&node{Kind: "note", Text: fmt.Sprintf(format, args...)})
 }
 
-// addp adds a child with a source position for the left gutter.
-func (n *node) addp(pos, format string, args ...any) *node {
-	return n.add(&node{pos: pos, text: fmt.Sprintf(format, args...)})
+// notep adds an informational child pointing at a source position.
+func (n *node) notep(pos, format string, args ...any) *node {
+	return n.add(&node{Kind: "note", Pos: pos, Text: fmt.Sprintf(format, args...)})
 }
 
 // prune removes structural nodes that contain no trace events.
 func prune(n *node) {
-	kept := n.kids[:0]
-	for _, k := range n.kids {
+	kept := n.Kids[:0]
+	for _, k := range n.Kids {
 		prune(k)
-		if k.structural && len(k.kids) == 0 {
+		if k.structural && len(k.Kids) == 0 {
 			continue
 		}
 		kept = append(kept, k)
 	}
-	n.kids = kept
+	n.Kids = kept
 }
 
 // numberLoops assigns loop numbers in trace order (depth-first).
 func numberLoops(n *node, counter *int) {
 	if n.loop {
 		*counter++
-		n.text = fmt.Sprintf(n.text, *counter)
+		n.Num = *counter
 	}
-	for _, k := range n.kids {
+	for _, k := range n.Kids {
 		numberLoops(k, counter)
-	}
-}
-
-// render prints the tree with file:line in a fixed-width left gutter and
-// the trace itself indented to the right.
-func render(w io.Writer, root *node) {
-	width := 0
-	measure(root, &width)
-	renderAt(w, root, 0, width)
-}
-
-func measure(n *node, width *int) {
-	if len(n.pos) > *width {
-		*width = len(n.pos)
-	}
-	for _, k := range n.kids {
-		measure(k, width)
-	}
-}
-
-func renderAt(w io.Writer, n *node, depth, width int) {
-	fmt.Fprintf(w, "%-*s │ %s%s\n", width, n.pos, strings.Repeat("  ", depth), n.text)
-	for _, k := range n.kids {
-		renderAt(w, k, depth+1, width)
 	}
 }
