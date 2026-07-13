@@ -5,7 +5,9 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"golang.org/x/tools/go/packages"
@@ -13,6 +15,129 @@ import (
 )
 
 const maxExprLen = 48
+
+// fileSrc returns (and caches) the raw contents of a source file.
+func (a *analyzer) fileSrc(name string) []byte {
+	if b, ok := a.src[name]; ok {
+		return b
+	}
+	b, err := os.ReadFile(name)
+	if err != nil {
+		b = nil
+	}
+	a.src[name] = b
+	return b
+}
+
+// srcRange returns the exact source text between two positions, or "" if
+// unavailable.
+func (a *analyzer) srcRange(start, end token.Pos) string {
+	if !start.IsValid() || !end.IsValid() {
+		return ""
+	}
+	f := a.fset.File(start)
+	if f == nil || a.fset.File(end) != f {
+		return ""
+	}
+	src := a.fileSrc(f.Name())
+	so, eo := f.Offset(start), f.Offset(end)
+	if src == nil || so < 0 || eo > len(src) || so >= eo {
+		return ""
+	}
+	return string(src[so:eo])
+}
+
+// spansForRange slices the source text of [start,end) into spans, marking
+// every identifier under roots that resolves to a variable or struct field
+// with its alias-class ID.
+func (a *analyzer) spansForRange(p *packages.Package, start, end token.Pos, roots ...ast.Node) []span {
+	text := a.srcRange(start, end)
+	if text == "" {
+		return nil
+	}
+	type mark struct{ s, e, id int }
+	var marks []mark
+	base := int(start)
+	for _, root := range roots {
+		if root == nil {
+			continue
+		}
+		ast.Inspect(root, func(n ast.Node) bool {
+			id, ok := n.(*ast.Ident)
+			if !ok || id.Name == "_" {
+				return true
+			}
+			obj := p.TypesInfo.Uses[id]
+			if obj == nil {
+				obj = p.TypesInfo.Defs[id]
+			}
+			if v, ok := obj.(*types.Var); ok {
+				marks = append(marks, mark{int(id.Pos()) - base, int(id.End()) - base, a.varID(v)})
+			}
+			return true
+		})
+	}
+	slices.SortFunc(marks, func(x, y mark) int { return x.s - y.s })
+	var out []span
+	prev := 0
+	for _, m := range marks {
+		if m.s < prev || m.e > len(text) {
+			continue
+		}
+		if m.s > prev {
+			out = append(out, span{T: flattenWS(text[prev:m.s])})
+		}
+		out = append(out, span{T: text[m.s:m.e], V: m.id})
+		prev = m.e
+	}
+	if prev < len(text) {
+		out = append(out, span{T: flattenWS(text[prev:])})
+	}
+	return out
+}
+
+// exprSpans renders an expression as source text with variable occurrences
+// marked. Falls back to a plain unmarked span if the source is unavailable.
+func (a *analyzer) exprSpans(p *packages.Package, e ast.Expr) []span {
+	if out := a.spansForRange(p, e.Pos(), e.End(), e); out != nil {
+		return out
+	}
+	return []span{{T: exprStr(e)}}
+}
+
+// flattenWS collapses whitespace runs (multi-line expressions) to single
+// spaces.
+func flattenWS(s string) string {
+	if !strings.ContainsAny(s, "\n\t") {
+		return s
+	}
+	fields := strings.FieldsFunc(s, func(r rune) bool { return r == '\n' || r == '\t' || r == '\r' })
+	out := strings.Join(fields, " ")
+	if strings.HasPrefix(s, "\n") || strings.HasPrefix(s, "\t") {
+		out = " " + out
+	}
+	if strings.HasSuffix(s, "\n") || strings.HasSuffix(s, "\t") {
+		out += " "
+	}
+	return out
+}
+
+// truncateSpans caps the total rendered length, never splitting a variable
+// span in half.
+func truncateSpans(spans []span, budget int) []span {
+	total := 0
+	for i, s := range spans {
+		if total+len(s.T) > budget {
+			out := slices.Clone(spans[:i])
+			if keep := budget - total; keep > 3 && s.V == 0 {
+				out = append(out, span{T: strings.ToValidUTF8(s.T[:keep], "")})
+			}
+			return append(out, span{T: "…"})
+		}
+		total += len(s.T)
+	}
+	return spans
+}
 
 // exprStr renders an expression as compact, single-line source text.
 func exprStr(e ast.Expr) string {
@@ -57,8 +182,8 @@ func (a *analyzer) annotateArg(p *packages.Package, arg ast.Expr, parent *node) 
 		switch obj := p.TypesInfo.Uses[x].(type) {
 		case *types.Var:
 			if desc, at, ok := a.describeVarOrigin(obj); ok {
-				parent.add(&node{Pos: at, Kind: "arg",
-					Text: prefix + x.Name + " ← " + desc})
+				spans := append([]span{{T: prefix}, {T: x.Name, V: a.varID(obj)}, {T: " ← "}}, desc...)
+				parent.add(nodeWithSpans(at, "arg", "", spans))
 			}
 		case *types.Func:
 			parent.add(&node{Pos: a.relPos(obj.Pos()), Kind: "arg", Label: a.classify(obj.Pkg()),
@@ -69,32 +194,82 @@ func (a *analyzer) annotateArg(p *packages.Package, arg ast.Expr, parent *node) 
 			Text: prefix + "func{…} ← function literal"})
 	case *ast.SelectorExpr:
 		if sel, ok := p.TypesInfo.Selections[x]; ok && sel.Kind() == types.FieldVal {
-			parent.add(&node{Pos: a.relPos(sel.Obj().Pos()), Kind: "arg",
-				Text: prefix + exprStr(x) + " ← struct field " + sel.Obj().Name()})
+			spans := append(a.exprSpans(p, x), span{T: " ← struct field " + sel.Obj().Name()})
+			parent.add(nodeWithSpans(a.relPos(sel.Obj().Pos()), "arg", "", spans))
 		}
 	}
 }
 
+// bindParams emits one "param ← argument" row per parameter of a local
+// call, making the caller→callee renaming visible and trackable: expanding
+// findModuleRoot(filepath.Dir(absFile)) shows `dir ← filepath.Dir(absFile)`
+// with both sides clickable. When the argument is a plain variable with a
+// known origin, the origin is appended.
+func (a *analyzer) bindParams(p *packages.Package, call *ast.CallExpr, fn *types.Func, parent *node) {
+	sig := fn.Origin().Signature()
+	if recv := sig.Recv(); recv != nil && recv.Name() != "" && recv.Name() != "_" {
+		if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok {
+			recvSpans := truncateSpans(a.exprSpans(p, sel.X), 40)
+			if spansText(recvSpans) != recv.Name() { // skip no-op rows like "p ← p"
+				spans := append([]span{{T: recv.Name(), V: a.varID(recv)}, {T: " ← "}}, recvSpans...)
+				parent.add(nodeWithSpans(a.relPos(recv.Pos()), "param", "", spans))
+			}
+		}
+	}
+	for i, arg := range call.Args {
+		if i >= sig.Params().Len() || (sig.Variadic() && i >= sig.Params().Len()-1) {
+			a.annotateArg(p, arg, parent)
+			continue
+		}
+		param := sig.Params().At(i)
+		if param.Name() == "" || param.Name() == "_" {
+			a.annotateArg(p, arg, parent)
+			continue
+		}
+		spans := append([]span{{T: param.Name(), V: a.varID(param)}, {T: " ← "}},
+			truncateSpans(a.exprSpans(p, arg), 45)...)
+		pos := a.relPos(param.Pos())
+		if id, ok := ast.Unparen(unwrapAddr(arg)).(*ast.Ident); ok {
+			if v, ok := p.TypesInfo.Uses[id].(*types.Var); ok {
+				if desc, at, ok := a.describeVarOrigin(v); ok {
+					spans = append(append(spans, span{T: " — "}), desc...)
+					pos = at
+				}
+			}
+		}
+		parent.add(nodeWithSpans(pos, "param", "", spans))
+	}
+}
+
+func unwrapAddr(e ast.Expr) ast.Expr {
+	if u, ok := ast.Unparen(e).(*ast.UnaryExpr); ok && u.Op == token.AND {
+		return u.X
+	}
+	return e
+}
+
 // describeVarOrigin explains where a variable came from: parameter,
-// make/new, composite literal, call result, etc.
-func (a *analyzer) describeVarOrigin(v *types.Var) (desc, at string, ok bool) {
+// make/new, composite literal, call result, etc. The description is
+// returned as spans so variables inside it stay trackable.
+func (a *analyzer) describeVarOrigin(v *types.Var) (desc []span, at string, ok bool) {
 	site, found := a.defs[v]
 	if !found {
-		return "", "", false
+		return nil, "", false
 	}
 	at = a.relPos(site.node.Pos())
 	switch d := site.node.(type) {
 	case *ast.Field:
 		if v.IsField() {
-			return "struct field " + v.Name(), at, true
+			return []span{{T: "struct field " + v.Name()}}, at, true
 		}
-		return fmt.Sprintf("parameter %q of %s", v.Name(),
-			a.enclosingFuncName(site.pkg, site.file, site.node.Pos())), at, true
+		return []span{{T: fmt.Sprintf("parameter %q of %s", v.Name(),
+			a.enclosingFuncName(site.pkg, site.file, site.node.Pos()))}}, at, true
 	case *ast.AssignStmt:
 		return a.describeAssignRHS(site.pkg, d, v), at, true
 	case *ast.ValueSpec:
 		if len(d.Values) == 0 {
-			return "var declaration (zero value " + types.TypeString(v.Type(), types.RelativeTo(v.Pkg())) + ")", at, true
+			return []span{{T: "var declaration (zero value " +
+				types.TypeString(v.Type(), types.RelativeTo(v.Pkg())) + ")"}}, at, true
 		}
 		for i, name := range d.Names {
 			if name.Name == v.Name() && i < len(d.Values) {
@@ -103,14 +278,15 @@ func (a *analyzer) describeVarOrigin(v *types.Var) (desc, at string, ok bool) {
 		}
 		return a.describeRHS(site.pkg, d.Values[0]), at, true
 	case *ast.RangeStmt:
-		return "range iteration variable over " + exprStr(d.X), at, true
+		return append([]span{{T: "range iteration variable over "}},
+			truncateSpans(a.exprSpans(site.pkg, d.X), 40)...), at, true
 	case *ast.TypeSwitchStmt:
-		return "type switch binding", at, true
+		return []span{{T: "type switch binding"}}, at, true
 	}
-	return "", "", false
+	return nil, "", false
 }
 
-func (a *analyzer) describeAssignRHS(p *packages.Package, as *ast.AssignStmt, v *types.Var) string {
+func (a *analyzer) describeAssignRHS(p *packages.Package, as *ast.AssignStmt, v *types.Var) []span {
 	idx := -1
 	for i, lhs := range as.Lhs {
 		if id, ok := ast.Unparen(lhs).(*ast.Ident); ok {
@@ -129,36 +305,40 @@ func (a *analyzer) describeAssignRHS(p *packages.Package, as *ast.AssignStmt, v 
 	}
 	// x, y := f() — one call producing multiple results.
 	if idx >= 0 {
-		return fmt.Sprintf("result #%d of %s", idx+1, exprStr(as.Rhs[0]))
+		return append([]span{{T: fmt.Sprintf("result #%d of ", idx+1)}},
+			truncateSpans(a.exprSpans(p, as.Rhs[0]), 45)...)
 	}
 	return a.describeRHS(p, as.Rhs[0])
 }
 
-func (a *analyzer) describeRHS(p *packages.Package, e ast.Expr) string {
+func (a *analyzer) describeRHS(p *packages.Package, e ast.Expr) []span {
+	with := func(head string, expr ast.Expr, budget int) []span {
+		return append([]span{{T: head}}, truncateSpans(a.exprSpans(p, expr), budget)...)
+	}
 	switch x := ast.Unparen(e).(type) {
 	case *ast.CallExpr:
 		if b, ok := typeutil.Callee(p.TypesInfo, x).(*types.Builtin); ok {
 			switch b.Name() {
 			case "make", "new", "append":
-				return "allocated by " + exprStr(x)
+				return with("allocated by ", x, 50)
 			}
 		}
-		return "result of call " + exprStr(x.Fun) + "(…)"
+		return append(with("result of call ", x.Fun, 40), span{T: "(…)"})
 	case *ast.UnaryExpr:
 		if x.Op == token.AND {
-			return "pointer allocation &" + exprStr(x.X)
+			return with("pointer allocation ", x, 50)
 		}
 		if x.Op == token.ARROW {
-			return "received from channel " + exprStr(x.X)
+			return with("received from channel ", x.X, 40)
 		}
 	case *ast.CompositeLit:
-		return "composite literal " + exprStr(x)
+		return with("composite literal ", x, 50)
 	case *ast.BasicLit:
-		return "literal " + x.Value
+		return []span{{T: "literal " + x.Value}}
 	case *ast.FuncLit:
-		return "function literal"
+		return []span{{T: "function literal"}}
 	case *ast.Ident:
-		return "copy of " + x.Name
+		return with("copy of ", x, 40)
 	}
-	return "expression " + exprStr(e)
+	return with("expression ", e, 50)
 }

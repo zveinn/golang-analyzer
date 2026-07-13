@@ -16,9 +16,12 @@ const BADGES = {
   bound: { text: 'bound', cls: 'b-impl' },
   defer: { text: 'defer', cls: 'b-defer' },
   arg: { text: 'arg', cls: 'b-arg' },
+  param: { text: 'param', cls: 'b-arg' },
   peer: { text: 'peer', cls: 'b-peer' },
   note: { text: 'ℹ', cls: 'b-note' },
 }
+
+const VAR_PALETTE_SIZE = 10
 
 function walk(n, fn) {
   fn(n)
@@ -29,6 +32,10 @@ function countSubtree(n) {
   let c = 1
   n.kids?.forEach((k) => (c += countSubtree(k)))
   return c
+}
+
+function nodeHasVar(n, v) {
+  return n.spans?.some((s) => s.v === v) ?? false
 }
 
 // matchTree marks a node visible if it, or any descendant, contains the
@@ -51,6 +58,8 @@ function matchTree(n, q, out) {
 export default function TraceView({ trace }) {
   const [collapsed, setCollapsed] = useState(() => new Set())
   const [filter, setFilter] = useState('')
+  // tracked is the variable being followed: {v, name}
+  const [tracked, setTracked] = useState(null)
 
   const visible = useMemo(() => {
     const q = filter.trim().toLowerCase()
@@ -59,6 +68,15 @@ export default function TraceView({ trace }) {
     matchTree(trace.root, q, out)
     return out
   }, [filter, trace.root])
+
+  const trackedCount = useMemo(() => {
+    if (!tracked) return 0
+    let c = 0
+    walk(trace.root, (n) => {
+      c += n.spans?.filter((s) => s.v === tracked.v).length ?? 0
+    })
+    return c
+  }, [tracked, trace.root])
 
   const toggle = (id) =>
     setCollapsed((prev) => {
@@ -74,6 +92,28 @@ export default function TraceView({ trace }) {
       if (n !== trace.root && n.kids?.length) s.add(n._id)
     })
     setCollapsed(s)
+    setTracked(null)
+  }
+
+  // Clicking a variable tracks it: highlight every occurrence and expand
+  // every collapsed path that contains one.
+  const clickVar = (v, name) => {
+    if (tracked?.v === v) {
+      setTracked(null)
+      return
+    }
+    setTracked({ v, name })
+    const onPath = new Set()
+    const mark = (n) => {
+      let has = nodeHasVar(n, v)
+      n.kids?.forEach((k) => {
+        if (mark(k)) has = true
+      })
+      if (has) onPath.add(n._id)
+      return has
+    }
+    mark(trace.root)
+    setCollapsed((prev) => new Set([...prev].filter((id) => !onPath.has(id))))
   }
 
   return (
@@ -102,6 +142,13 @@ export default function TraceView({ trace }) {
             ✕
           </button>
         )}
+        {tracked && (
+          <button className="ghost tracking" onClick={() => setTracked(null)}>
+            tracking{' '}
+            <span className={`var v${tracked.v % VAR_PALETTE_SIZE} var-sel`}>{tracked.name}</span>{' '}
+            · {trackedCount}× · ✕
+          </button>
+        )}
         <span className="toolbar-gap" />
         <button className="ghost" onClick={() => setCollapsed(new Set())}>
           expand all
@@ -112,31 +159,66 @@ export default function TraceView({ trace }) {
       </div>
 
       <div className="tree">
-        <Row n={trace.root} depth={0} collapsed={collapsed} onToggle={toggle} visible={visible} />
+        <Row
+          n={trace.root}
+          depth={0}
+          collapsed={collapsed}
+          onToggle={toggle}
+          visible={visible}
+          tracked={tracked}
+          onVarClick={clickVar}
+        />
       </div>
 
       <div className="legend">
         <span className="chip label-local">local</span> traced into ·{' '}
         <span className="chip label-stdlib">stdlib</span> /{' '}
         <span className="chip label-module">module</span> labeled only ·{' '}
-        <span className="badge b-go">go</span> goroutine launch ·{' '}
+        <span className="badge b-go">go</span> goroutine ·{' '}
         <span className="badge b-send">send</span>
-        <span className="badge b-recv">recv</span> channel ops with peers underneath
+        <span className="badge b-recv">recv</span> channel ops ·{' '}
+        <span className="var v3 legend-var">variable</span> click to track through the trace
       </div>
     </div>
   )
 }
 
-function Row({ n, depth, collapsed, onToggle, visible }) {
+function NodeText({ n, tracked, onVarClick }) {
+  if (!n.spans) return <span className="text">{n.text}</span>
+  return (
+    <span className="text">
+      {n.spans.map((s, i) =>
+        s.v ? (
+          <button
+            key={i}
+            className={`var v${s.v % VAR_PALETTE_SIZE} ${tracked?.v === s.v ? 'var-sel' : ''}`}
+            title="click to track this variable"
+            onClick={(e) => {
+              e.stopPropagation()
+              onVarClick(s.v, s.t)
+            }}
+          >
+            {s.t}
+          </button>
+        ) : (
+          <span key={i}>{s.t}</span>
+        ),
+      )}
+    </span>
+  )
+}
+
+function Row({ n, depth, collapsed, onToggle, visible, tracked, onVarClick }) {
   if (visible && !visible.has(n._id)) return null
   const kids = n.kids ?? []
   const isCollapsed = !visible && collapsed.has(n._id)
   const badge = BADGES[n.kind]
   const badgeText = n.kind === 'loop' && n.num ? `loop ${n.num}` : badge?.text
+  const hit = tracked && nodeHasVar(n, tracked.v)
 
   return (
     <>
-      <div className={`row k-${n.kind || 'plain'}`}>
+      <div className={`row k-${n.kind || 'plain'} ${hit ? 'row-hit' : tracked ? 'row-dim' : ''}`}>
         <span className="gutter" title={n.pos}>
           {n.pos}
         </span>
@@ -149,14 +231,23 @@ function Row({ n, depth, collapsed, onToggle, visible }) {
             <span className="disc spacer" />
           )}
           {badge && <span className={`badge ${badge.cls}`}>{badgeText}</span>}
-          <span className="text">{n.text}</span>
+          <NodeText n={n} tracked={tracked} onVarClick={onVarClick} />
           {n.label && <span className={`chip label-${n.label}`}>{n.label}</span>}
           {isCollapsed && <span className="hidden-count">+{countSubtree(n) - 1} hidden</span>}
         </span>
       </div>
       {!isCollapsed &&
         kids.map((k) => (
-          <Row key={k._id} n={k} depth={depth + 1} collapsed={collapsed} onToggle={onToggle} visible={visible} />
+          <Row
+            key={k._id}
+            n={k}
+            depth={depth + 1}
+            collapsed={collapsed}
+            onToggle={onToggle}
+            visible={visible}
+            tracked={tracked}
+            onVarClick={onVarClick}
+          />
         ))}
     </>
   )

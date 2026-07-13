@@ -62,11 +62,20 @@ Each websocket message is one envelope:
 {"type": "error", "target": "...", "time": "...", "text": "message"}
 ```
 
-A node is `{pos, kind, label, num, text, kids}` where `kind` is one of:
+A node is `{pos, kind, label, num, text, spans, kids}` where `kind` is one of:
 `root`, `call`, `interface-call`, `func-value-call`, `indirect-call`,
 `impl`, `bound`, `go`, `defer`, `loop` (with `num`), `branch`, `case`,
 `select`, `chan-send`, `chan-recv`, `chan-close`, `peer`, `arg`, `note`;
 `label` classifies callees as `local`/`stdlib`/`module`.
+
+`spans` splits the node text into segments `{t, v}`: segments with `v != 0`
+are variable occurrences, and `v` is the variable's **alias-class ID** —
+stable across the whole trace. Two variables connected by argument passing
+(including method receivers), assignment, struct-literal field init or
+return values share one ID, computed by the backend's union-find. The UI
+colors variables by ID and, when one is clicked, highlights every occurrence
+and auto-expands each collapsed path the variable propagates through — all
+without doing any analysis client-side.
 
 ## Trace vocabulary
 
@@ -80,6 +89,7 @@ A node is `{pos, kind, label, num, text, kids}` where `kind` is one of:
 | `func-value-call` + `bound` | call through a function-typed variable; the bound literal/function is resolved when statically possible |
 | `defer` | deferred call (runs at function exit) |
 | `arg` | where a call argument was allocated or produced (`make`, `&T{…}`, parameter, call result, range variable, …); `pos` points at the allocation site |
+| `param` | caller→callee name binding for local calls (`dir ← filepath.Dir(absFile)`), so a value stays trackable across the rename at every call boundary |
 | `branch` / `case` / `select` | control-flow context — all paths are traced |
 | `note` | recursion cut-offs, "body already traced" references (`pos` points at the first expansion), missing peers, depth limits |
 
@@ -99,10 +109,12 @@ analyzer is built on the Go compiler front-end:
 
 On top of that sit three module-wide indexes built in a pre-pass:
 
-1. **Channel alias classes** — a union-find that connects the two ends of a
-   channel across argument passing, returns, plain assignments and struct
-   literal fields. This is how a `<-p.jobs` in a worker finds the `jobs <- i`
-   in a producer three functions away.
+1. **Value alias classes** — a union-find that connects variables, struct
+   fields and channels across argument passing (including receivers),
+   returns, plain assignments and struct literal fields. This is how a
+   `<-p.jobs` in a worker finds the `jobs <- i` in a producer three
+   functions away, and how clicking `ctx` in the UI lights up the same
+   context inside every callee it was passed to.
 2. **Interface implementations** — every named type in the module is checked
    against the called interface (`types.Implements`), so dynamic dispatch
    sites list all possible concrete targets.

@@ -31,9 +31,14 @@ type analyzer struct {
 	defs map[types.Object]defSite
 	// chanOps is every channel send/recv/close/range in the module.
 	chanOps []chanOp
-	// aliasParent is union-find state connecting channel aliases across
-	// argument passing, returns and assignments.
+	// aliasParent is union-find state connecting value aliases (variables,
+	// fields, channels) across argument passing, returns and assignments.
 	aliasParent map[any]any
+	// varIDs assigns stable per-trace IDs to variable alias classes, used
+	// by the UI to color and track variables.
+	varIDs map[any]int
+	// src caches file contents for source-exact span extraction.
+	src map[string][]byte
 	// named is every non-generic named type in the module, for interface dispatch.
 	named []*types.Named
 
@@ -82,6 +87,8 @@ func newAnalyzer(absFile string) (*analyzer, error) {
 		funcs:        map[*types.Func]funcDef{},
 		defs:         map[types.Object]defSite{},
 		aliasParent:  map[any]any{},
+		varIDs:       map[any]int{},
+		src:          map[string][]byte{},
 		expandedAt:   map[*types.Func]string{},
 		expandedLits: map[*ast.FuncLit]string{},
 		maxDepth:     defaultMaxDepth,
@@ -225,16 +232,29 @@ func (a *analyzer) indexFile(p *packages.Package, f *ast.File) {
 					a.recordChanOp(p, f, chanClose, x.Args[0], x.Pos())
 				}
 			}
-			// Channel argument → callee parameter aliasing.
-			if fn, ok := typeutil.Callee(info, x).(*types.Func); ok {
+			// Argument → callee parameter and receiver aliasing, for both
+			// channel endpoint matching and variable propagation tracking.
+			// Only local callees: stdlib/module bodies are never traced, so
+			// unioning through them would just create false hubs merging
+			// unrelated variables (e.g. everything passed to fmt.Sprintf).
+			if fn, ok := typeutil.Callee(info, x).(*types.Func); ok && a.classify(fn.Pkg()) == "local" {
 				sig := fn.Origin().Signature()
+				if recv := sig.Recv(); recv != nil {
+					if sel, ok := ast.Unparen(x.Fun).(*ast.SelectorExpr); ok {
+						a.union(a.aliasKey(info, sel.X), recv)
+					}
+				}
 				for i, arg := range x.Args {
 					if i >= sig.Params().Len() {
 						break
 					}
-					if isChanType(info.TypeOf(arg)) {
-						a.union(a.chanKey(info, arg), sig.Params().At(i))
+					// A variadic parameter collects many values into a
+					// slice — it does not alias any single argument, and
+					// unioning through it merges unrelated variables.
+					if sig.Variadic() && i >= sig.Params().Len()-1 {
+						break
 					}
+					a.union(a.aliasKey(info, arg), sig.Params().At(i))
 				}
 			}
 		case *ast.AssignStmt:
@@ -255,31 +275,62 @@ func (a *analyzer) indexFile(p *packages.Package, f *ast.File) {
 	})
 }
 
-// assignAliases unions channel identities across assignments, including
-// multi-value binds from a single call: ch := makeCh() / a, b := twoCh().
+// assignAliases unions value identities across assignments, including
+// multi-value binds from a single call: x, y := f().
 func (a *analyzer) assignAliases(info *types.Info, lhs, rhs []ast.Expr) {
 	if len(rhs) == 1 && len(lhs) > 1 {
-		if call, ok := ast.Unparen(rhs[0]).(*ast.CallExpr); ok {
-			if fn, ok := typeutil.Callee(info, call).(*types.Func); ok {
-				for i, l := range lhs {
-					if isChanType(info.TypeOf(l)) {
-						a.union(chanRootObj(info, l), resultKey{fn: fn.Origin(), idx: i})
-					}
-				}
+		call, ok := ast.Unparen(rhs[0]).(*ast.CallExpr)
+		if !ok {
+			return
+		}
+		fn, ok := typeutil.Callee(info, call).(*types.Func)
+		if !ok {
+			return
+		}
+		if a.classify(fn.Pkg()) == "local" {
+			for i, l := range lhs {
+				a.union(lhsKey(info, l), resultKey{fn: fn.Origin(), idx: i})
 			}
+			return
+		}
+		// Untraced callee in the common (value, error) shape: link the value
+		// result to the call's single variable-rooted input, so chains like
+		// abs, err := filepath.Abs(path) keep abs ~ path connected.
+		allErrors := true
+		for _, l := range lhs[1:] {
+			if id, ok := ast.Unparen(l).(*ast.Ident); ok && id.Name == "_" {
+				continue
+			}
+			if !isErrorType(info.TypeOf(l)) {
+				allErrors = false
+				break
+			}
+		}
+		if allErrors && !isErrorType(info.TypeOf(lhs[0])) {
+			a.union(lhsKey(info, lhs[0]), a.derivedKey(info, call, fn))
 		}
 		return
 	}
 	for i := range min(len(lhs), len(rhs)) {
-		if isChanType(info.TypeOf(rhs[i])) {
-			a.union(chanRootObj(info, lhs[i]), a.chanKey(info, rhs[i]))
-		}
+		a.union(lhsKey(info, lhs[i]), a.aliasKey(info, rhs[i]))
 	}
 }
 
-// returnAliases unions "result #i of fn" with the channel expressions the
-// function actually returns. Returns inside function literals are skipped —
-// they belong to the literal, not the declared function.
+// lhsKey resolves an assignment target (which may be a fresh := definition)
+// to its alias key.
+func lhsKey(info *types.Info, e ast.Expr) any {
+	if isChanType(info.TypeOf(e)) {
+		return chanRootObj(info, e)
+	}
+	if o := varRootObj(info, e); o != nil {
+		return o
+	}
+	return nil
+}
+
+// returnAliases unions "result #i of fn" with the expressions the function
+// actually returns. Returns inside function literals are skipped — they
+// belong to the literal, not the declared function.
 func (a *analyzer) returnAliases(info *types.Info, stack []ast.Node, ret *ast.ReturnStmt) {
 	for i := len(stack) - 1; i >= 0; i-- {
 		switch d := stack[i].(type) {
@@ -291,16 +342,14 @@ func (a *analyzer) returnAliases(info *types.Info, stack []ast.Node, ret *ast.Re
 				return
 			}
 			for ri, res := range ret.Results {
-				if isChanType(info.TypeOf(res)) {
-					a.union(resultKey{fn: fn.Origin(), idx: ri}, a.chanKey(info, res))
-				}
+				a.union(resultKey{fn: fn.Origin(), idx: ri}, a.aliasKey(info, res))
 			}
 			return
 		}
 	}
 }
 
-// compositeAliases unions struct fields with the channels they are
+// compositeAliases unions struct fields with the values they are
 // initialized to in composite literals.
 func (a *analyzer) compositeAliases(info *types.Info, lit *ast.CompositeLit) {
 	t := info.TypeOf(lit)
@@ -310,14 +359,11 @@ func (a *analyzer) compositeAliases(info *types.Info, lit *ast.CompositeLit) {
 	st, _ := t.Underlying().(*types.Struct)
 	for i, elt := range lit.Elts {
 		if kv, ok := elt.(*ast.KeyValueExpr); ok {
-			if !isChanType(info.TypeOf(kv.Value)) {
-				continue
-			}
 			if id, ok := kv.Key.(*ast.Ident); ok {
-				a.union(info.Uses[id], a.chanKey(info, kv.Value))
+				a.union(info.Uses[id], a.aliasKey(info, kv.Value))
 			}
-		} else if st != nil && i < st.NumFields() && isChanType(info.TypeOf(elt)) {
-			a.union(st.Field(i), a.chanKey(info, elt))
+		} else if st != nil && i < st.NumFields() {
+			a.union(st.Field(i), a.aliasKey(info, elt))
 		}
 	}
 }

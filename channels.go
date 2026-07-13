@@ -73,6 +73,115 @@ func (a *analyzer) chanKey(info *types.Info, e ast.Expr) any {
 	return nil
 }
 
+// aliasKey maps any expression to its alias-class key, used to track how a
+// value propagates through the trace (variable, struct field, or the result
+// slot of the call producing it). Result slots of stdlib/module calls are
+// not keys: their bodies are never traced, and linking through them would
+// merge unrelated variables (every `x := f()` of the same stdlib f).
+func (a *analyzer) aliasKey(info *types.Info, e ast.Expr) any {
+	e = ast.Unparen(e)
+	if isChanType(info.TypeOf(e)) {
+		// Channels keep the wider linking so endpoint matching still works.
+		return a.chanKey(info, e)
+	}
+	if call, ok := e.(*ast.CallExpr); ok {
+		fn, ok := typeutil.Callee(info, call).(*types.Func)
+		if !ok {
+			return nil
+		}
+		if a.classify(fn.Pkg()) == "local" {
+			return resultKey{fn: fn.Origin(), idx: 0}
+		}
+		return a.derivedKey(info, call, fn)
+	}
+	if o := varRootObj(info, e); o != nil {
+		return o
+	}
+	return nil
+}
+
+// derivedKey links the result of an untraced (stdlib/module) call to its
+// single variable-rooted argument, when unambiguous: filepath.Dir(absFile)
+// is "derived from" absFile, so tracking flows through it. Calls mixing
+// several variables (fmt.Sprintf("%s:%d", file, line)) yield nothing —
+// merging them would create false hubs. Error-producing calls are excluded
+// (fmt.Errorf("… %s", dir) describes dir, it doesn't carry it), as are
+// method receivers (x.Pos() would bridge every AST node in this codebase).
+func (a *analyzer) derivedKey(info *types.Info, call *ast.CallExpr, fn *types.Func) any {
+	res := fn.Signature().Results()
+	if res.Len() == 1 && isErrorType(res.At(0).Type()) {
+		return nil
+	}
+	var keys []any
+	for _, arg := range call.Args {
+		k := a.aliasKey(info, arg)
+		if k == nil {
+			continue
+		}
+		dup := false
+		for _, have := range keys {
+			if a.find(have) == a.find(k) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 1 {
+		return keys[0]
+	}
+	return nil
+}
+
+// isErrorType reports whether t is exactly the built-in error type.
+func isErrorType(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	return types.Identical(t, types.Universe.Lookup("error").Type())
+}
+
+// varRootObj resolves an expression to the variable or struct field it
+// denotes, for propagation tracking.
+func varRootObj(info *types.Info, e ast.Expr) types.Object {
+	switch x := ast.Unparen(e).(type) {
+	case *ast.Ident:
+		obj := info.Uses[x]
+		if obj == nil {
+			obj = info.Defs[x]
+		}
+		if v, ok := obj.(*types.Var); ok {
+			return v
+		}
+	case *ast.UnaryExpr:
+		if x.Op == token.AND {
+			return varRootObj(info, x.X)
+		}
+	case *ast.StarExpr:
+		return varRootObj(info, x.X)
+	case *ast.SelectorExpr:
+		if sel, ok := info.Selections[x]; ok && sel.Kind() == types.FieldVal {
+			return sel.Obj()
+		}
+	}
+	return nil
+}
+
+// varID returns the stable ID of a variable's alias class, allocating one
+// on first use. Two variables connected by argument passing, assignment or
+// return share an ID.
+func (a *analyzer) varID(obj types.Object) int {
+	root := a.find(obj)
+	if id, ok := a.varIDs[root]; ok {
+		return id
+	}
+	id := len(a.varIDs) + 1
+	a.varIDs[root] = id
+	return id
+}
+
 // find/union implement union-find over channel alias keys, connecting the
 // two ends of a channel across argument passing, returns and assignments.
 func (a *analyzer) find(k any) any {
@@ -154,17 +263,24 @@ func (a *analyzer) chanPeers(key any, kind chanOpKind, selfPos token.Pos) []chan
 
 // chanEvent emits a trace node for a channel operation, listing the
 // opposite endpoints found anywhere in the module.
-func (a *analyzer) chanEvent(p *packages.Package, kind chanOpKind, ch ast.Expr, valText string, pos token.Pos, parent *node) {
-	var nodeKind, text string
+func (a *analyzer) chanEvent(p *packages.Package, kind chanOpKind, ch ast.Expr, val ast.Expr, pos token.Pos, parent *node) {
+	var nodeKind string
+	var spans []span
 	switch kind {
 	case chanSend:
-		nodeKind, text = "chan-send", exprStr(ch)+" <- "+valText
+		nodeKind = "chan-send"
+		spans = append(a.exprSpans(p, ch), span{T: " <- "})
+		if val != nil {
+			spans = append(spans, a.exprSpans(p, val)...)
+		}
 	case chanRecv:
-		nodeKind, text = "chan-recv", "<-"+exprStr(ch)
+		nodeKind = "chan-recv"
+		spans = append([]span{{T: "<-"}}, a.exprSpans(p, ch)...)
 	case chanClose:
-		nodeKind, text = "chan-close", "close("+exprStr(ch)+")"
+		nodeKind = "chan-close"
+		spans = append(append([]span{{T: "close("}}, a.exprSpans(p, ch)...), span{T: ")"})
 	}
-	n := parent.add(&node{Pos: a.relPos(pos), Kind: nodeKind, Text: text})
+	n := parent.add(nodeWithSpans(a.relPos(pos), nodeKind, "", truncateSpans(spans, 80)))
 
 	key := a.chanKey(p.TypesInfo, ch)
 	if key == nil {

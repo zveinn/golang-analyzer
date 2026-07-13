@@ -432,6 +432,60 @@ body {
   color: var(--dim);
 }
 
+/* variables — colored by alias-class id (v0..v9), clickable to track */
+
+.var {
+  background: none;
+  border: none;
+  padding: 0 1px;
+  margin: 0;
+  font: inherit;
+  cursor: pointer;
+  border-bottom: 1px dotted color-mix(in srgb, currentColor 55%, transparent);
+  border-radius: 3px;
+}
+
+.var:hover {
+  background: color-mix(in srgb, currentColor 16%, transparent);
+}
+
+.var-sel {
+  background: color-mix(in srgb, currentColor 22%, transparent);
+  border-bottom-style: solid;
+  font-weight: 700;
+}
+
+.v0 { color: #ff7b72; }
+.v1 { color: #ffa657; }
+.v2 { color: #d2a8ff; }
+.v3 { color: #7ee787; }
+.v4 { color: #79c0ff; }
+.v5 { color: #f2cc60; }
+.v6 { color: #56d4dd; }
+.v7 { color: #f778ba; }
+.v8 { color: #9ece6a; }
+.v9 { color: #e3967a; }
+
+.row-hit {
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+}
+
+.row-hit:hover {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.row-dim {
+  opacity: 0.45;
+}
+
+.toolbar .tracking {
+  color: var(--fg);
+}
+
+.legend-var {
+  cursor: default;
+}
+
 /* label chips (local/stdlib/module) */
 
 .chip {

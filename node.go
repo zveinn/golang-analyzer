@@ -1,6 +1,26 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
+
+// span is one segment of a node's text. Segments with V != 0 are variable
+// occurrences: V is the variable's alias-class ID, stable across the whole
+// trace, so the UI can color and track a variable through argument passing,
+// assignments and returns without doing any analysis itself.
+type span struct {
+	T string `json:"t"`
+	V int    `json:"v,omitempty"`
+}
+
+func spansText(spans []span) string {
+	var sb strings.Builder
+	for _, s := range spans {
+		sb.WriteString(s.T)
+	}
+	return sb.String()
+}
 
 // node is one entry in the execution trace tree. It serializes directly to
 // JSON for the UI, which renders it without further interpretation — every
@@ -20,6 +40,9 @@ type node struct {
 	Num  int     `json:"num,omitempty"`
 	Text string  `json:"text"`
 	Kids []*node `json:"kids,omitempty"`
+	// Spans is Text split into segments with variable occurrences marked;
+	// when present, Text is the plain concatenation of the segments.
+	Spans []span `json:"spans,omitempty"`
 
 	// structural nodes (loops, branches, select) are pruned when they end
 	// up with no children, since they carry no calls or channel activity.
@@ -30,6 +53,11 @@ type node struct {
 func (n *node) add(k *node) *node {
 	n.Kids = append(n.Kids, k)
 	return k
+}
+
+// nodeWithSpans builds a node whose text carries variable markers.
+func nodeWithSpans(pos, kind, label string, spans []span) *node {
+	return &node{Pos: pos, Kind: kind, Label: label, Spans: spans, Text: spansText(spans)}
 }
 
 // note adds a plain informational child without a source position.
