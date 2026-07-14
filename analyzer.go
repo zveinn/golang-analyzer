@@ -52,6 +52,11 @@ type analyzer struct {
 	maxDepth  int
 	expandAll bool
 
+	// reachableFns is the set of functions reachable from the module's
+	// entry points (main, init, exported functions, methods, package-level
+	// references); built lazily by the scanner.
+	reachableFns map[*types.Func]bool
+
 	// expandedAt records where each function body was first expanded in the
 	// trace; later call sites reference it instead of re-printing the body,
 	// so shared helpers (and their loops) appear exactly once.

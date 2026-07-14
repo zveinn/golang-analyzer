@@ -288,24 +288,43 @@ func (a *analyzer) racesInGoroutine(p *packages.Package, f *ast.File, gs *ast.Go
 	}
 	for _, acc := range collectAccesses(p.TypesInfo, encl, lit) {
 		if s, tracked := byVar[acc.v]; tracked {
-			// Concurrent with the goroutine: anything after the launch —
-			// or anywhere in the loop body when the launch sits inside a
-			// loop AND the variable outlives iterations. Range/loop-local
-			// variables are per-iteration (Go ≥1.22): each goroutine gets
-			// its own copy, so only same-iteration accesses after the
-			// launch can race.
+			// Concurrent with the goroutine: anything after the launch — or
+			// inside the launching loop's body (later iterations run beside
+			// earlier goroutines) when the variable outlives iterations.
+			// Accesses before the loop happen-before every launch, and
+			// range/loop-local variables are per-iteration (Go ≥1.22): each
+			// goroutine gets its own copy, so only same-iteration accesses
+			// after the launch can race.
 			perIteration := loop != nil && within(acc.v.Pos(), loop)
-			if acc.pos > gs.End() || (loop != nil && !perIteration) {
+			if acc.pos > gs.End() || (loop != nil && !perIteration && within(acc.pos, loop)) {
 				s.out = append(s.out, acc)
 			}
 		}
 	}
 
 	gsArms := branchArms(encl, gs.Pos())
+	reachable := a.declReachable(p, f, gs.Pos())
+	doneWGs := a.wgDoneClasses(p, lit)
+	waits := a.wgWaitCalls(p, encl)
+
+	// An access after a wg.Wait() that joins this goroutine (the goroutine
+	// calls Done on the same WaitGroup) is synchronized, not racy.
+	syncedAfterLaunch := func(accPos token.Pos) bool {
+		for _, w := range waits {
+			if w.pos > gs.End() && w.pos < accPos && doneWGs[w.key] {
+				return true
+			}
+		}
+		return false
+	}
 
 	var out []finding
 	for v, s := range byVar {
 		wIn := firstWrite(s.in)
+
+		// A goroutine launched in a loop that writes the variable races its
+		// own instances — concrete no matter what the parent does.
+		multiInstance := wIn != nil && loop != nil && !within(v.Pos(), loop)
 
 		// conflicting outside accesses: any access when the goroutine
 		// writes, writes only when the goroutine just reads
@@ -319,8 +338,14 @@ func (a *analyzer) racesInGoroutine(p *packages.Package, f *ast.File, gs *ast.Go
 				}
 			}
 		}
-		if len(candidates) == 0 {
-			continue
+		var live []identAcc
+		for _, c := range candidates {
+			if !syncedAfterLaunch(c.pos) {
+				live = append(live, c)
+			}
+		}
+		if !multiInstance && len(live) == 0 {
+			continue // no unsynchronized counterpart — not a race
 		}
 
 		// An access is CONFIRMED concurrent if — given the goroutine was
@@ -328,44 +353,64 @@ func (a *analyzer) racesInGoroutine(p *packages.Package, f *ast.File, gs *ast.Go
 		// it also guards the launch. Accesses guarded by other branches
 		// (possibly mutually exclusive with the launch, e.g. the else of a
 		// condition correlated with spawning) only race if the branch
-		// conditions can coincide → downgraded to a warning.
+		// conditions can coincide.
 		var conflict *identAcc
 		confirmed := false
 		for pass := 0; pass < 2 && conflict == nil; pass++ {
-			for i := range candidates {
-				if pass == 0 && candidates[i].pos <= gs.End() {
+			for i := range live {
+				if pass == 0 && live[i].pos <= gs.End() {
 					continue // prefer evidence after the launch
 				}
-				if armsSubset(branchArms(encl, candidates[i].pos), gsArms) {
-					conflict = &candidates[i]
+				if armsSubset(branchArms(encl, live[i].pos), gsArms) {
+					conflict = &live[i]
 					confirmed = true
 					break
 				}
 			}
 		}
-		if conflict == nil {
-			conflict = &candidates[0]
-			for i := range candidates {
-				if candidates[i].pos > gs.End() {
-					conflict = &candidates[i]
+		if conflict == nil && len(live) > 0 {
+			conflict = &live[0]
+			for i := range live {
+				if live[i].pos > gs.End() {
+					conflict = &live[i]
 					break
 				}
 			}
 		}
 
-		kind, suffix := "race", " — captured by goroutine without synchronization"
-		if !confirmed {
-			kind, suffix = "race-warn", " — captured by goroutine; the conflicting access is in a different branch"
+		// Grade: RACE only when the race is concrete in the current
+		// codebase — everything theoretical is RACE WARN with the reason.
+		kind := "race"
+		var reasons []string
+		if !multiInstance && !confirmed {
+			kind = "race-warn"
+			reasons = append(reasons,
+				"the branches guarding the launch and this access may be mutually exclusive — racy only if a code change lets them overlap")
+		}
+		if !reachable {
+			kind = "race-warn"
+			reasons = append(reasons,
+				"the enclosing function has no callers in this codebase — the race needs new calling code to occur")
+		}
+
+		suffix := " — captured by goroutine without synchronization"
+		if kind == "race-warn" {
+			suffix = " — captured by goroutine; theoretical in the current codebase"
 		}
 		spans := []span{{T: "potential data race on "}, {T: v.Name(), V: a.varID(v)}, {T: suffix}}
 		n := nodeWithSpans(a.relPos(s.in[0].pos), kind, "", spans)
 		n.notep(a.relPos(gs.Pos()), "goroutine launched here")
+		if multiInstance {
+			n.notep(a.relPos(loop.Pos()), "launched inside a loop — multiple goroutine instances access the variable concurrently")
+		}
 		if wIn != nil {
 			n.notep(a.relPos(wIn.pos), "written inside the goroutine")
 		}
-		n.notep(a.relPos(conflict.pos), "%s outside the goroutine", accWord(conflict))
-		if !confirmed {
-			n.note("the branches guarding the launch and this access may be mutually exclusive — racy only if a code change lets them overlap")
+		if conflict != nil {
+			n.notep(a.relPos(conflict.pos), "%s outside the goroutine", accWord(conflict))
+		}
+		for _, r := range reasons {
+			n.note("%s", r)
 		}
 		out = append(out, finding{pos: s.in[0].pos, n: n})
 	}
@@ -457,6 +502,166 @@ func enclosingLoop(root ast.Node, target ast.Node) ast.Node {
 		return true
 	})
 	return loop
+}
+
+// ---------- reachability ----------
+
+// buildReachability computes the set of local functions reachable from the
+// module's entry points. Roots: main, init, every exported function, every
+// method (they may be invoked through interfaces), and functions referenced
+// from package-level declarations. Unexported plain functions must be
+// referenced (called or used as a value) from a reachable function.
+func (a *analyzer) buildReachability() {
+	edges := map[*types.Func][]*types.Func{}
+	var roots []*types.Func
+
+	for fn, def := range a.funcs {
+		fd := def.decl
+		if fd.Recv != nil || fd.Name.IsExported() || fd.Name.Name == "main" || fd.Name.Name == "init" {
+			roots = append(roots, fn)
+		}
+		if fd.Body == nil {
+			continue
+		}
+		info := def.pkg.TypesInfo
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok {
+				if callee, ok := info.Uses[id].(*types.Func); ok {
+					if _, local := a.funcs[callee.Origin()]; local {
+						edges[fn] = append(edges[fn], callee.Origin())
+					}
+				}
+			}
+			return true
+		})
+	}
+
+	// package-level declarations referencing functions (var handler = fn)
+	for _, p := range a.pkgs {
+		for _, f := range p.Syntax {
+			for _, decl := range f.Decls {
+				gd, ok := decl.(*ast.GenDecl)
+				if !ok {
+					continue
+				}
+				ast.Inspect(gd, func(n ast.Node) bool {
+					if id, ok := n.(*ast.Ident); ok {
+						if fn, ok := p.TypesInfo.Uses[id].(*types.Func); ok {
+							if _, local := a.funcs[fn.Origin()]; local {
+								roots = append(roots, fn.Origin())
+							}
+						}
+					}
+					return true
+				})
+			}
+		}
+	}
+
+	reach := map[*types.Func]bool{}
+	queue := roots
+	for len(queue) > 0 {
+		fn := queue[0]
+		queue = queue[1:]
+		if reach[fn] {
+			continue
+		}
+		reach[fn] = true
+		queue = append(queue, edges[fn]...)
+	}
+	a.reachableFns = reach
+}
+
+// declReachable reports whether the function declaration enclosing pos is
+// reachable from the module's entry points.
+func (a *analyzer) declReachable(p *packages.Package, f *ast.File, pos token.Pos) bool {
+	if a.reachableFns == nil {
+		a.buildReachability()
+	}
+	fd := enclosingFuncDecl(f, pos)
+	if fd == nil {
+		return true // package-level initializer — runs at import
+	}
+	fn, ok := p.TypesInfo.Defs[fd.Name].(*types.Func)
+	if !ok {
+		return true
+	}
+	return a.reachableFns[fn.Origin()]
+}
+
+func enclosingFuncDecl(f *ast.File, pos token.Pos) *ast.FuncDecl {
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Pos() <= pos && pos <= fd.End() {
+			return fd
+		}
+	}
+	return nil
+}
+
+// ---------- sync.WaitGroup helpers ----------
+
+func isWaitGroupType(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	named, ok := types.Unalias(deref(t)).(*types.Named)
+	if !ok {
+		return false
+	}
+	pkg := named.Obj().Pkg()
+	return pkg != nil && pkg.Path() == "sync" && named.Obj().Name() == "WaitGroup"
+}
+
+// wgDoneClasses returns the alias classes of WaitGroups this goroutine
+// calls Done on (including in defers and nested literals).
+func (a *analyzer) wgDoneClasses(p *packages.Package, lit *ast.FuncLit) map[any]bool {
+	out := map[any]bool{}
+	ast.Inspect(lit.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) != 0 {
+			return true
+		}
+		sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "Done" || !isWaitGroupType(p.TypesInfo.TypeOf(sel.X)) {
+			return true
+		}
+		if k := varRootObj(p.TypesInfo, sel.X); k != nil {
+			out[a.find(k)] = true
+		}
+		return true
+	})
+	return out
+}
+
+type wgWait struct {
+	key any
+	pos token.Pos
+}
+
+// wgWaitCalls collects non-deferred WaitGroup.Wait() calls in the same flow
+// as body (deferred Waits run at function exit and don't order in-body
+// accesses).
+func (a *analyzer) wgWaitCalls(p *packages.Package, body *ast.BlockStmt) []wgWait {
+	var out []wgWait
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.FuncLit, *ast.GoStmt, *ast.DeferStmt:
+			return false
+		case *ast.CallExpr:
+			if len(x.Args) != 0 {
+				return true
+			}
+			sel, ok := ast.Unparen(x.Fun).(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Wait" || !isWaitGroupType(p.TypesInfo.TypeOf(sel.X)) {
+				return true
+			}
+			if k := varRootObj(p.TypesInfo, sel.X); k != nil {
+				out = append(out, wgWait{key: a.find(k), pos: x.Pos()})
+			}
+		}
+		return true
+	})
+	return out
 }
 
 // ---------- 2. writes to closed channels ----------
@@ -603,12 +808,8 @@ func (a *analyzer) waitGroupWaitBefore(pos token.Pos) bool {
 		if !ok || sel.Sel.Name != "Wait" {
 			return true
 		}
-		if t := p.TypesInfo.TypeOf(sel.X); t != nil {
-			if named, ok := types.Unalias(deref(t)).(*types.Named); ok {
-				if pkg := named.Obj().Pkg(); pkg != nil && pkg.Path() == "sync" && named.Obj().Name() == "WaitGroup" {
-					found = true
-				}
-			}
+		if isWaitGroupType(p.TypesInfo.TypeOf(sel.X)) {
+			found = true
 		}
 		return true
 	})

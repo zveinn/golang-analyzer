@@ -56,6 +56,37 @@ func BranchCorrelated(n int) int {
 	return 0
 }
 
+// WaitGroupSynced writes from a single goroutine and reads only after
+// joining it — fully synchronized, must NOT be flagged at all.
+func WaitGroupSynced(n int) int {
+	result := 0
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		result = n * 2
+	}()
+	wg.Wait()
+	return result
+}
+
+// unreachableRace contains a textbook race, but nothing in this codebase
+// calls it — the race is theoretical until someone wires it up, so it must
+// be flagged as RACE WARN, not RACE.
+func unreachableRace(n int) int { //nolint:unused // deliberately uncalled
+	x := 0
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			x++
+		}()
+	}
+	wg.Wait()
+	return x
+}
+
 // AtomicCounterOK does the same work with sync/atomic — must NOT be
 // flagged as a race.
 func AtomicCounterOK(n int) int64 {
