@@ -447,6 +447,11 @@ body {
   color: var(--orange);
 }
 
+.b-return {
+  background: color-mix(in srgb, var(--err) 16%, transparent);
+  color: var(--err);
+}
+
 .b-arg,
 .b-peer,
 .b-note {
@@ -507,6 +512,13 @@ body {
   background: color-mix(in srgb, currentColor 22%, transparent);
   border-bottom-style: solid;
   font-weight: 700;
+}
+
+/* returned variable: red underline marker, but keep the alias-class fill
+   color so the variable stays visually trackable and clickable. */
+.var-ret {
+  border-bottom: 2px solid var(--err);
+  border-radius: 3px 3px 0 0;
 }
 
 .v0 { color: #ff7b72; }

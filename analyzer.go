@@ -53,6 +53,9 @@ type analyzer struct {
 	litDepth  int
 	nodeCount int
 	truncated bool
+	// resultStack is the result signature of each function/literal currently
+	// being expanded, so bare `return` rows can name the declared results.
+	resultStack []*ast.FieldList
 
 	// maxDepth and expandAll are tunable per request ("depth" and "expand"
 	// parameters on the TCP intake).

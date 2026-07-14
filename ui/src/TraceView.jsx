@@ -16,6 +16,7 @@ const BADGES = {
   impl: { text: 'impl', cls: 'b-impl' },
   bound: { text: 'bound', cls: 'b-impl' },
   defer: { text: 'defer', cls: 'b-defer' },
+  return: { text: 'return', cls: 'b-return' },
   arg: { text: 'arg', cls: 'b-arg' },
   param: { text: 'param', cls: 'b-arg' },
   race: { text: 'race', cls: 'b-race' },
@@ -191,7 +192,9 @@ export default function TraceView({ trace }) {
         <span className="badge b-go">go</span> goroutine ·{' '}
         <span className="badge b-send">send</span>
         <span className="badge b-recv">recv</span> channel ops ·{' '}
-        <span className="var v3 legend-var">variable</span> click to track through the trace
+        <span className="var v3 legend-var">variable</span> click to track through the trace ·{' '}
+        <span className="badge b-return">return</span>
+        <span className="var v0 legend-var var-ret">value</span> returned variable
       </div>
     </div>
   )
@@ -205,8 +208,8 @@ function NodeText({ n, tracked, onVarClick }) {
         s.v ? (
           <button
             key={i}
-            className={`var v${s.v % VAR_PALETTE_SIZE} ${tracked?.v === s.v ? 'var-sel' : ''}`}
-            title="click to track this variable"
+            className={`var v${s.v % VAR_PALETTE_SIZE} ${tracked?.v === s.v ? 'var-sel' : ''} ${s.r ? 'var-ret' : ''}`}
+            title={s.r ? 'returned value · click to track' : 'click to track this variable'}
             onClick={(e) => {
               e.stopPropagation()
               onVarClick(s.v, s.t)

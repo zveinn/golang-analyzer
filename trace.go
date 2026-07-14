@@ -20,7 +20,9 @@ func (a *analyzer) trace(t *target) *node {
 	}
 	a.expandedAt[t.fn.Origin()] = a.relPos(t.def.decl.Pos())
 	a.stack = append(a.stack, t.fn.Origin())
+	a.resultStack = append(a.resultStack, t.def.decl.Type.Results)
 	a.block(t.def.pkg, t.def.decl.Body, root)
+	a.resultStack = a.resultStack[:len(a.resultStack)-1]
 	a.stack = a.stack[:0]
 	prune(root)
 	var loops int
@@ -141,8 +143,13 @@ func (a *analyzer) stmt(p *packages.Package, s ast.Stmt, parent *node) {
 			}
 		}
 	case *ast.ReturnStmt:
+		rn := parent
+		if spans := a.returnSpans(p, x); spans != nil {
+			rn = parent.add(nodeWithSpans(a.relPos(x.Pos()), "return", "", spans))
+			a.annotateReturn(p, x, rn)
+		}
 		for _, e := range x.Results {
-			a.expr(p, e, parent)
+			a.expr(p, e, rn)
 		}
 	case *ast.DeclStmt:
 		if gd, ok := x.Decl.(*ast.GenDecl); ok {
@@ -211,6 +218,56 @@ func (a *analyzer) structuralNode(p *packages.Package, pos, kind, head string, e
 	n := nodeWithSpans(pos, kind, "", spans)
 	n.structural = true
 	return n
+}
+
+// returnSpans renders a return statement as "return a, b" with the returned
+// variables marked (R) so the UI can flag them red while keeping their
+// alias-class color. A bare `return` names the enclosing function's declared
+// results. Returns nil when there is nothing to show (a void return).
+func (a *analyzer) returnSpans(p *packages.Package, x *ast.ReturnStmt) []span {
+	var out []span
+	if len(x.Results) > 0 {
+		for i, e := range x.Results {
+			if i > 0 {
+				out = append(out, span{T: ", "})
+			}
+			out = append(out, a.exprSpans(p, e)...)
+		}
+	} else {
+		// Bare return: name the declared results of the enclosing function.
+		var results *ast.FieldList
+		if n := len(a.resultStack); n > 0 {
+			results = a.resultStack[n-1]
+		}
+		if results == nil {
+			return nil
+		}
+		for _, field := range results.List {
+			for _, name := range field.Names {
+				if name.Name == "_" {
+					continue
+				}
+				if len(out) > 0 {
+					out = append(out, span{T: ", "})
+				}
+				sp := span{T: name.Name}
+				if v, ok := p.TypesInfo.Defs[name].(*types.Var); ok {
+					sp.V = a.varID(v)
+				}
+				out = append(out, sp)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil // void return — nothing to mark
+	}
+	// Flag the returned variables (keep their alias-class color for tracking).
+	for i := range out {
+		if out[i].V != 0 {
+			out[i].R = true
+		}
+	}
+	return truncateSpans(out, 90)
 }
 
 // rootSpans renders the traced function's signature with its receiver and
@@ -510,7 +567,9 @@ func (a *analyzer) expand(fn *types.Func, label string, at string, n *node) {
 	}
 	a.expandedAt[origin] = at
 	a.stack = append(a.stack, origin)
+	a.resultStack = append(a.resultStack, def.decl.Type.Results)
 	a.block(def.pkg, def.decl.Body, n)
+	a.resultStack = a.resultStack[:len(a.resultStack)-1]
 	a.stack = a.stack[:len(a.stack)-1]
 }
 
@@ -527,7 +586,9 @@ func (a *analyzer) expandLit(p *packages.Package, lit *ast.FuncLit, at string, n
 	}
 	a.expandedLits[lit] = at
 	a.litDepth++
+	a.resultStack = append(a.resultStack, lit.Type.Results)
 	a.block(p, lit.Body, n)
+	a.resultStack = a.resultStack[:len(a.resultStack)-1]
 	a.litDepth--
 }
 

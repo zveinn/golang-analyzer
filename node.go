@@ -12,6 +12,9 @@ import (
 type span struct {
 	T string `json:"t"`
 	V int    `json:"v,omitempty"`
+	// R marks a returned variable (rendered with a red marker in the UI while
+	// keeping its alias-class color, so it stays trackable).
+	R bool `json:"r,omitempty"`
 }
 
 func spansText(spans []span) string {

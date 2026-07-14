@@ -200,6 +200,40 @@ func (a *analyzer) annotateArg(p *packages.Package, arg ast.Expr, parent *node) 
 	}
 }
 
+// annotateReturn adds an "X ← origin" child under a return row for each
+// returned variable, describing where it was allocated — mirroring
+// annotateArg. A bare `return` uses the enclosing function's named results.
+func (a *analyzer) annotateReturn(p *packages.Package, x *ast.ReturnStmt, parent *node) {
+	if len(x.Results) > 0 {
+		for _, e := range x.Results {
+			a.annotateArg(p, e, parent)
+		}
+		return
+	}
+	var results *ast.FieldList
+	if n := len(a.resultStack); n > 0 {
+		results = a.resultStack[n-1]
+	}
+	if results == nil {
+		return
+	}
+	for _, field := range results.List {
+		for _, name := range field.Names {
+			if name.Name == "_" {
+				continue
+			}
+			v, ok := p.TypesInfo.Defs[name].(*types.Var)
+			if !ok {
+				continue
+			}
+			if desc, at, ok := a.describeVarOrigin(v); ok {
+				spans := append([]span{{T: name.Name, V: a.varID(v)}, {T: " ← "}}, desc...)
+				parent.add(nodeWithSpans(at, "arg", "", spans))
+			}
+		}
+	}
+}
+
 // bindParams emits one "param ← argument" row per parameter of a local
 // call, making the caller→callee renaming visible and trackable: expanding
 // findModuleRoot(filepath.Dir(absFile)) shows `dir ← filepath.Dir(absFile)`
@@ -262,7 +296,12 @@ func (a *analyzer) describeVarOrigin(v *types.Var) (desc []span, at string, ok b
 		if v.IsField() {
 			return []span{{T: "struct field " + v.Name()}}, at, true
 		}
-		return []span{{T: fmt.Sprintf("parameter %q of %s", v.Name(),
+		role := "parameter"
+		if fd := enclosingFuncDecl(site.file, d.Pos()); fd != nil && fd.Type.Results != nil &&
+			d.Pos() >= fd.Type.Results.Pos() && d.End() <= fd.Type.Results.End() {
+			role = "named result"
+		}
+		return []span{{T: fmt.Sprintf("%s %q of %s", role, v.Name(),
 			a.enclosingFuncName(site.pkg, site.file, site.node.Pos()))}}, at, true
 	case *ast.AssignStmt:
 		return a.describeAssignRHS(site.pkg, d, v), at, true
