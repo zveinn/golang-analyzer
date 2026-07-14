@@ -117,6 +117,13 @@ func (a *analyzer) derivedKey(info *types.Info, call *ast.CallExpr, fn *types.Fu
 	}
 	var keys []any
 	for _, arg := range call.Args {
+		// A context.Context is an ambient capability threaded through almost
+		// every call, not the value a result is derived from. Treating it as
+		// the derivation source merges every `v, err := f(ctx)` value into the
+		// context's alias class, collapsing most of the module into one hub.
+		if isContextType(info.TypeOf(arg)) {
+			continue
+		}
 		k := a.aliasKey(info, arg)
 		if k == nil {
 			continue
@@ -146,6 +153,17 @@ func isErrorType(t types.Type) bool {
 	return types.Identical(t, types.Universe.Lookup("error").Type())
 }
 
+// isContextType reports whether t is context.Context.
+func isContextType(t types.Type) bool {
+	named, ok := t.(*types.Named)
+	if !ok {
+		return false
+	}
+	obj := named.Obj()
+	return obj != nil && obj.Pkg() != nil &&
+		obj.Pkg().Path() == "context" && obj.Name() == "Context"
+}
+
 // varRootObj resolves an expression to the variable or struct field it
 // denotes, for propagation tracking.
 func varRootObj(info *types.Info, e ast.Expr) types.Object {
@@ -172,21 +190,27 @@ func varRootObj(info *types.Info, e ast.Expr) types.Object {
 	return nil
 }
 
-// varID returns the stable ID of a variable's alias class, allocating one
-// on first use. Two variables connected by argument passing, assignment or
-// return share an ID.
+// varID returns a stable per-object token for a variable during trace-tree
+// construction: each distinct object gets its own token, and occurrences of
+// the SAME object share it. Tokens are collapsed into final alias-class colors
+// by remapVarIDs once the tree is built — using only the edges whose gating
+// function was actually expanded in this trace. This keeps coloring
+// trace-scoped: a parameter shared by hundreds of call sites across the module
+// no longer bleeds every caller's arguments into one color.
 func (a *analyzer) varID(obj types.Object) int {
-	root := a.find(obj)
-	if id, ok := a.varIDs[root]; ok {
+	if id, ok := a.objToken[obj]; ok {
 		return id
 	}
-	id := len(a.varIDs) + 1
-	a.varIDs[root] = id
+	id := len(a.tokenObj) + 1
+	a.objToken[obj] = id
+	a.tokenObj = append(a.tokenObj, obj)
 	return id
 }
 
-// find/union implement union-find over channel alias keys, connecting the
-// two ends of a channel across argument passing, returns and assignments.
+// find/union implement union-find over alias keys, connecting the two ends of
+// a channel across argument passing, returns and assignments. This
+// module-wide relation drives channel endpoint matching and the scan
+// detectors; variable coloring uses the trace-scoped replay in remapVarIDs.
 func (a *analyzer) find(k any) any {
 	if k == nil {
 		return nil
@@ -208,6 +232,89 @@ func (a *analyzer) union(x, y any) {
 	if rx != ry {
 		a.aliasParent[rx] = ry
 	}
+}
+
+// aliasEdge is one value-aliasing connection recorded during indexing, tagged
+// with the function/literal whose expansion makes it relevant to a trace.
+type aliasEdge struct {
+	x, y any
+	gate any // *types.Func origin, *ast.FuncLit, or nil (always in scope)
+}
+
+// rel records a value-aliasing edge for trace-scoped variable coloring, and
+// also unions it into the module-wide relation used by channel matching and
+// the scan detectors (preserving prior behavior for those).
+func (a *analyzer) rel(gate, x, y any) {
+	if x == nil || y == nil {
+		return
+	}
+	a.edges = append(a.edges, aliasEdge{x: x, y: y, gate: gate})
+	a.union(x, y)
+}
+
+// remapVarIDs collapses the per-object tokens in the built trace tree into
+// final colors, replaying only the aliasing edges whose gating context was
+// expanded in this trace.
+func (a *analyzer) remapVarIDs(root *node) {
+	inScope := func(gate any) bool {
+		switch g := gate.(type) {
+		case nil:
+			return true
+		case *types.Func:
+			_, ok := a.expandedAt[g]
+			return ok
+		case *ast.FuncLit:
+			_, ok := a.expandedLits[g]
+			return ok
+		}
+		return false
+	}
+	parent := map[any]any{}
+	var tfind func(k any) any
+	tfind = func(k any) any {
+		p, ok := parent[k]
+		if !ok {
+			return k
+		}
+		r := tfind(p)
+		parent[k] = r
+		return r
+	}
+	tunion := func(x, y any) {
+		if x == nil || y == nil {
+			return
+		}
+		rx, ry := tfind(x), tfind(y)
+		if rx != ry {
+			parent[rx] = ry
+		}
+	}
+	for _, e := range a.edges {
+		if inScope(e.gate) {
+			tunion(e.x, e.y)
+		}
+	}
+	color := map[any]int{}
+	var walk func(n *node)
+	walk = func(n *node) {
+		for i := range n.Spans {
+			if n.Spans[i].V == 0 {
+				continue
+			}
+			obj := a.tokenObj[n.Spans[i].V-1]
+			r := tfind(obj)
+			c, ok := color[r]
+			if !ok {
+				c = len(color) + 1
+				color[r] = c
+			}
+			n.Spans[i].V = c
+		}
+		for _, k := range n.Kids {
+			walk(k)
+		}
+	}
+	walk(root)
 }
 
 // chanRootObj resolves a channel expression to a stable object identity:

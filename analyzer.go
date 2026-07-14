@@ -34,9 +34,16 @@ type analyzer struct {
 	// aliasParent is union-find state connecting value aliases (variables,
 	// fields, channels) across argument passing, returns and assignments.
 	aliasParent map[any]any
-	// varIDs assigns stable per-trace IDs to variable alias classes, used
-	// by the UI to color and track variables.
-	varIDs map[any]int
+	// objToken/tokenObj assign a stable per-object token to each variable as
+	// its spans are built; remapVarIDs collapses tokens into final colors.
+	objToken map[types.Object]int
+	tokenObj []types.Object
+	// edges are value-aliasing connections tagged with the context whose
+	// expansion makes them relevant, replayed trace-scoped by remapVarIDs.
+	edges []aliasEdge
+	// idxCtx is the function/literal currently being indexed, used to gate
+	// intra-function aliasing edges.
+	idxCtx any
 	// src caches file contents for source-exact span extraction.
 	src map[string][]byte
 	// named is every non-generic named type in the module, for interface dispatch.
@@ -119,7 +126,7 @@ func newAnalyzerAt(dir string) (*analyzer, error) {
 		funcs:        map[*types.Func]funcDef{},
 		defs:         map[types.Object]defSite{},
 		aliasParent:  map[any]any{},
-		varIDs:       map[any]int{},
+		objToken:     map[types.Object]int{},
 		src:          map[string][]byte{},
 		expandedAt:   map[*types.Func]string{},
 		expandedLits: map[*ast.FuncLit]string{},
@@ -276,12 +283,37 @@ func (a *analyzer) indexFile(p *packages.Package, f *ast.File) {
 	// The stack tracks ancestry so each defined ident can be tied to its
 	// enclosing statement/field.
 	var stack []ast.Node
+	// ctxStack tracks the enclosing function/literal so intra-function
+	// aliasing edges can be gated by it (a.idxCtx).
+	var ctxStack []any
+	a.idxCtx = nil
 	ast.Inspect(f, func(n ast.Node) bool {
 		if n == nil {
+			popped := stack[len(stack)-1]
 			stack = stack[:len(stack)-1]
+			switch popped.(type) {
+			case *ast.FuncDecl, *ast.FuncLit:
+				ctxStack = ctxStack[:len(ctxStack)-1]
+				a.idxCtx = nil
+				if len(ctxStack) > 0 {
+					a.idxCtx = ctxStack[len(ctxStack)-1]
+				}
+			}
 			return true
 		}
 		switch x := n.(type) {
+		case *ast.FuncDecl:
+			// Track the enclosing function so intra-function aliasing edges
+			// can be gated by it (a.idxCtx).
+			var ctx any
+			if fn, ok := info.Defs[x.Name].(*types.Func); ok {
+				ctx = fn.Origin()
+			}
+			ctxStack = append(ctxStack, ctx)
+			a.idxCtx = ctx
+		case *ast.FuncLit:
+			ctxStack = append(ctxStack, any(x))
+			a.idxCtx = x
 		case *ast.Ident:
 			if v, ok := info.Defs[x].(*types.Var); ok {
 				if site := nearestDefSite(stack); site != nil {
@@ -331,7 +363,7 @@ func (a *analyzer) indexFile(p *packages.Package, f *ast.File) {
 					sig := fn.Origin().Signature()
 					if recv := sig.Recv(); recv != nil {
 						if sel, ok := ast.Unparen(x.Fun).(*ast.SelectorExpr); ok {
-							a.union(a.aliasKey(info, sel.X), recv)
+							a.rel(fn.Origin(), a.aliasKey(info, sel.X), recv)
 						}
 					}
 					for i, arg := range x.Args {
@@ -353,7 +385,7 @@ func (a *analyzer) indexFile(p *packages.Package, f *ast.File) {
 							a.recordChanOp(p, f, chanClose, arg, x.Pos())
 							continue
 						}
-						a.union(a.aliasKey(info, arg), param)
+						a.rel(fn.Origin(), a.aliasKey(info, arg), param)
 					}
 				} else {
 					// Channels handed to non-local code (signal.Notify,
@@ -411,7 +443,7 @@ func (a *analyzer) assignAliases(info *types.Info, lhs, rhs []ast.Expr) {
 		}
 		if a.classify(fn.Pkg()) == "local" {
 			for i, l := range lhs {
-				a.union(lhsKey(info, l), resultKey{fn: fn.Origin(), idx: i})
+				a.rel(fn.Origin(), lhsKey(info, l), resultKey{fn: fn.Origin(), idx: i})
 			}
 			return
 		}
@@ -439,12 +471,19 @@ func (a *analyzer) assignAliases(info *types.Info, lhs, rhs []ast.Expr) {
 			}
 		}
 		if allErrors && !isErrorType(info.TypeOf(lhs[0])) {
-			a.union(lhsKey(info, lhs[0]), a.derivedKey(info, call, fn))
+			a.rel(a.idxCtx, lhsKey(info, lhs[0]), a.derivedKey(info, call, fn))
 		}
 		return
 	}
 	for i := range min(len(lhs), len(rhs)) {
-		a.union(lhsKey(info, lhs[i]), a.aliasKey(info, rhs[i]))
+		lk, rk := lhsKey(info, lhs[i]), a.aliasKey(info, rhs[i])
+		// A result-slot edge is gated by the callee (relevant only when that
+		// callee is expanded); other assignments by the enclosing context.
+		gate := a.idxCtx
+		if r, ok := rk.(resultKey); ok {
+			gate = r.fn
+		}
+		a.rel(gate, lk, rk)
 		// a channel received from another channel was handed off by the
 		// sender — its counterpart can't be judged locally
 		if u, ok := ast.Unparen(rhs[i]).(*ast.UnaryExpr); ok && u.Op == token.ARROW && isChanType(info.TypeOf(lhs[i])) {
@@ -481,7 +520,7 @@ func (a *analyzer) returnAliases(info *types.Info, stack []ast.Node, ret *ast.Re
 				return
 			}
 			for ri, res := range ret.Results {
-				a.union(resultKey{fn: fn.Origin(), idx: ri}, a.aliasKey(info, res))
+				a.rel(fn.Origin(), a.aliasKey(info, res), resultKey{fn: fn.Origin(), idx: ri})
 			}
 			return
 		}
@@ -499,10 +538,10 @@ func (a *analyzer) compositeAliases(info *types.Info, lit *ast.CompositeLit) {
 	for i, elt := range lit.Elts {
 		if kv, ok := elt.(*ast.KeyValueExpr); ok {
 			if id, ok := kv.Key.(*ast.Ident); ok {
-				a.union(info.Uses[id], a.aliasKey(info, kv.Value))
+				a.rel(a.idxCtx, a.aliasKey(info, kv.Value), info.Uses[id])
 			}
 		} else if st != nil && i < st.NumFields() {
-			a.union(st.Field(i), a.aliasKey(info, elt))
+			a.rel(a.idxCtx, a.aliasKey(info, elt), st.Field(i))
 		}
 	}
 }

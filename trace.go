@@ -25,6 +25,9 @@ func (a *analyzer) trace(t *target) *node {
 	prune(root)
 	var loops int
 	numberLoops(root, &loops)
+	// Collapse per-object variable tokens into final colors using only the
+	// aliasing edges whose gating context was expanded in this trace.
+	a.remapVarIDs(root)
 	if a.truncated {
 		root.note("… trace truncated (node limit %d reached)", maxNodes)
 	}

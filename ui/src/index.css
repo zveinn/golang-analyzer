@@ -4,6 +4,7 @@
   --panel: #11151d;
   --panel-2: #161b26;
   --border: #232936;
+  --rail: #1b212e;
   --fg: #dfe6f1;
   --dim: #7d8799;
   --dimmer: #566070;
@@ -334,6 +335,19 @@ body {
   gap: 7px;
   padding-left: calc(10px + var(--depth) * 18px);
   min-width: 0;
+  /* Faint vertical guide rails, one per ancestor level, drawn only across the
+     indentation zone (width = depth * 18px). Lets the eye follow nesting in
+     deep trees without any per-node last-child bookkeeping. */
+  background-image: repeating-linear-gradient(
+    to right,
+    var(--rail) 0,
+    var(--rail) 1px,
+    transparent 1px,
+    transparent 18px
+  );
+  background-repeat: no-repeat;
+  background-position: 10px 0;
+  background-size: calc(var(--depth) * 18px) 100%;
 }
 
 .disc {
@@ -370,13 +384,21 @@ body {
 /* badges (kind) */
 
 .badge {
-  font-size: 9.5px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-size: 10px;
+  font-weight: 600;
   border-radius: 4px;
   padding: 1px 6px;
   flex-shrink: 0;
+}
+
+/* Findings are the exception: keep them loud so they cut through the tree. */
+.b-race,
+.b-warn,
+.b-fd,
+.b-leak {
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .b-go {
@@ -529,9 +551,12 @@ body {
   flex-shrink: 0;
 }
 
+/* `local` is the default (traced into), so keep it recessive — the eye should
+   catch `stdlib`/`module`, which mark where tracing stops. */
 .chip.label-local {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--dimmer);
+  border-color: transparent;
+  padding: 0 3px;
 }
 
 .chip.label-stdlib {
