@@ -19,6 +19,7 @@ const BADGES = {
   arg: { text: 'arg', cls: 'b-arg' },
   param: { text: 'param', cls: 'b-arg' },
   race: { text: 'race', cls: 'b-race' },
+  'race-warn': { text: 'race warn', cls: 'b-warn' },
   'chan-closed': { text: 'closed ch', cls: 'b-close' },
   'fd-leak': { text: 'fd leak', cls: 'b-fd' },
   'go-leak': { text: 'leak', cls: 'b-leak' },

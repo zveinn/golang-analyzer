@@ -38,6 +38,24 @@ func RaceAppend(items []string) []int {
 	return lengths
 }
 
+// BranchCorrelated mirrors the mutually-exclusive-branches pattern: the
+// goroutine only exists when n > 10, and the conflicting write runs only
+// when n <= 10. This cannot race today — it should be flagged as a
+// RACE WARN (racy only after a code change), not a full RACE.
+func BranchCorrelated(n int) int {
+	result := 0
+	if n > 10 {
+		go func() {
+			result = n * 2 // write inside the goroutine
+		}()
+	}
+	if n <= 10 {
+		result = 5 // mutually exclusive with the goroutine's branch
+		return result
+	}
+	return 0
+}
+
 // AtomicCounterOK does the same work with sync/atomic — must NOT be
 // flagged as a race.
 func AtomicCounterOK(n int) int64 {

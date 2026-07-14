@@ -7,6 +7,15 @@ function nodeText(n, wrapVars) {
   return n.spans.map((s) => (s.v && wrapVars ? '`' + s.t + '`' : s.t)).join('')
 }
 
+// Severity labels per finding kind, mirroring the UI badges.
+const KIND_LABELS = {
+  race: 'RACE',
+  'race-warn': 'RACE WARN',
+  'chan-closed': 'CLOSED CHANNEL',
+  'fd-leak': 'FD LEAK',
+  'go-leak': 'LEAK',
+}
+
 function evidence(lines, n, depth) {
   const pad = '   '.repeat(depth)
   const pos = n.pos ? ' (`' + n.pos + '`)' : ''
@@ -31,7 +40,8 @@ export function scanToMarkdown(msg) {
         continue
       }
       i++
-      lines.push('', `${i}. **\`${f.pos ?? '?'}\`** — ${nodeText(f, true)}`)
+      const label = KIND_LABELS[f.kind] ? `**${KIND_LABELS[f.kind]}** ` : ''
+      lines.push('', `${i}. ${label}**\`${f.pos ?? '?'}\`** — ${nodeText(f, true)}`)
       f.kids?.forEach((k) => evidence(lines, k, 1))
     }
   }

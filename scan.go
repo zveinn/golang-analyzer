@@ -73,7 +73,7 @@ func (a *analyzer) scan(base string) *node {
 func countFindings(n *node) int {
 	c := 0
 	switch n.Kind {
-	case "race", "chan-closed", "fd-leak", "go-leak":
+	case "race", "race-warn", "chan-closed", "fd-leak", "go-leak":
 		c++
 	}
 	for _, k := range n.Kids {
@@ -301,38 +301,121 @@ func (a *analyzer) racesInGoroutine(p *packages.Package, f *ast.File, gs *ast.Go
 		}
 	}
 
+	gsArms := branchArms(encl, gs.Pos())
+
 	var out []finding
 	for v, s := range byVar {
 		wIn := firstWrite(s.in)
-		wOut := firstWrite(s.out)
+
+		// conflicting outside accesses: any access when the goroutine
+		// writes, writes only when the goroutine just reads
+		var candidates []identAcc
+		if wIn != nil {
+			candidates = s.out
+		} else if len(s.in) > 0 {
+			for _, o := range s.out {
+				if o.write {
+					candidates = append(candidates, o)
+				}
+			}
+		}
+		if len(candidates) == 0 {
+			continue
+		}
+
+		// An access is CONFIRMED concurrent if — given the goroutine was
+		// launched — it executes unconditionally: every branch arm guarding
+		// it also guards the launch. Accesses guarded by other branches
+		// (possibly mutually exclusive with the launch, e.g. the else of a
+		// condition correlated with spawning) only race if the branch
+		// conditions can coincide → downgraded to a warning.
 		var conflict *identAcc
-		switch {
-		case wIn != nil && len(s.out) > 0:
-			// cite an access after the launch when one exists — clearer
-			// evidence than a pre-launch access in a loop
-			conflict = &s.out[0]
-			for i := range s.out {
-				if s.out[i].pos > gs.End() {
-					conflict = &s.out[i]
+		confirmed := false
+		for pass := 0; pass < 2 && conflict == nil; pass++ {
+			for i := range candidates {
+				if pass == 0 && candidates[i].pos <= gs.End() {
+					continue // prefer evidence after the launch
+				}
+				if armsSubset(branchArms(encl, candidates[i].pos), gsArms) {
+					conflict = &candidates[i]
+					confirmed = true
 					break
 				}
 			}
-		case wOut != nil && len(s.in) > 0:
-			conflict = wOut
-		default:
-			continue
 		}
-		spans := []span{{T: "potential data race on "}, {T: v.Name(), V: a.varID(v)},
-			{T: " — captured by goroutine without synchronization"}}
-		n := nodeWithSpans(a.relPos(s.in[0].pos), "race", "", spans)
+		if conflict == nil {
+			conflict = &candidates[0]
+			for i := range candidates {
+				if candidates[i].pos > gs.End() {
+					conflict = &candidates[i]
+					break
+				}
+			}
+		}
+
+		kind, suffix := "race", " — captured by goroutine without synchronization"
+		if !confirmed {
+			kind, suffix = "race-warn", " — captured by goroutine; the conflicting access is in a different branch"
+		}
+		spans := []span{{T: "potential data race on "}, {T: v.Name(), V: a.varID(v)}, {T: suffix}}
+		n := nodeWithSpans(a.relPos(s.in[0].pos), kind, "", spans)
 		n.notep(a.relPos(gs.Pos()), "goroutine launched here")
 		if wIn != nil {
 			n.notep(a.relPos(wIn.pos), "written inside the goroutine")
 		}
-		n.notep(a.relPos(conflict.pos), "%s outside the goroutine, concurrent with it", accWord(conflict))
+		n.notep(a.relPos(conflict.pos), "%s outside the goroutine", accWord(conflict))
+		if !confirmed {
+			n.note("the branches guarding the launch and this access may be mutually exclusive — racy only if a code change lets them overlap")
+		}
 		out = append(out, finding{pos: s.in[0].pos, n: n})
 	}
 	return out
+}
+
+// branchArms returns the branch arms (if/else blocks, switch/select cases)
+// enclosing pos within root. Loops are not arms: their bodies are treated
+// as executing.
+func branchArms(root ast.Node, pos token.Pos) map[ast.Node]bool {
+	var best, stack []ast.Node
+	ast.Inspect(root, func(n ast.Node) bool {
+		if n == nil {
+			stack = stack[:len(stack)-1]
+			return true
+		}
+		if pos < n.Pos() || pos > n.End() {
+			return false
+		}
+		stack = append(stack, n)
+		if len(stack) > len(best) {
+			best = append(best[:0], stack...)
+		}
+		return true
+	})
+	arms := map[ast.Node]bool{}
+	for i, n := range best {
+		switch x := n.(type) {
+		case *ast.CaseClause, *ast.CommClause:
+			arms[n] = true
+		case *ast.IfStmt:
+			if i+1 < len(best) {
+				child := best[i+1]
+				if child == ast.Node(x.Body) || (x.Else != nil && child == x.Else) {
+					arms[child] = true
+				}
+			}
+		}
+	}
+	return arms
+}
+
+// armsSubset reports whether every arm in a also encloses b's position set.
+func armsSubset(a, b map[ast.Node]bool) bool {
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
 }
 
 func firstWrite(accs []identAcc) *identAcc {

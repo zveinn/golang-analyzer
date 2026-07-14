@@ -437,6 +437,15 @@ body {
   color: var(--err);
 }
 
+.b-warn {
+  background: color-mix(in srgb, var(--amber) 22%, transparent);
+  color: var(--amber);
+}
+
+.k-race-warn .text {
+  font-weight: 600;
+}
+
 .b-fd {
   background: color-mix(in srgb, var(--amber) 20%, transparent);
   color: var(--amber);
