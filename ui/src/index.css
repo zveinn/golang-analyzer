@@ -442,7 +442,8 @@ body {
   color: var(--amber);
 }
 
-.k-race-warn .text {
+.k-race-warn .text,
+.k-chan-closed-warn .text {
   font-weight: 600;
 }
 

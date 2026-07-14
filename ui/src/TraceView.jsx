@@ -21,6 +21,7 @@ const BADGES = {
   race: { text: 'race', cls: 'b-race' },
   'race-warn': { text: 'race warn', cls: 'b-warn' },
   'chan-closed': { text: 'closed ch', cls: 'b-close' },
+  'chan-closed-warn': { text: 'closed ch warn', cls: 'b-warn' },
   'fd-leak': { text: 'fd leak', cls: 'b-fd' },
   'go-leak': { text: 'leak', cls: 'b-leak' },
   peer: { text: 'peer', cls: 'b-peer' },

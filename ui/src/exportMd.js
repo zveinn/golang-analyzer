@@ -12,6 +12,7 @@ const KIND_LABELS = {
   race: 'RACE',
   'race-warn': 'RACE WARN',
   'chan-closed': 'CLOSED CHANNEL',
+  'chan-closed-warn': 'CLOSED CHANNEL WARN',
   'fd-leak': 'FD LEAK',
   'go-leak': 'LEAK',
 }

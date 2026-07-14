@@ -45,6 +45,26 @@ func CoordinatedCloseOK(n int) <-chan int {
 	return out
 }
 
+// BranchExclusiveClose closes and sends in mutually exclusive branches —
+// cannot panic today, so it must be graded CLOSED CH WARN (theoretical),
+// not a full finding.
+func BranchExclusiveClose(flag bool) {
+	ch := make(chan int, 1)
+	if flag {
+		close(ch)
+	} else {
+		ch <- 1
+	}
+}
+
+// unreachableSendAfterClose is a textbook panic, but nothing in this
+// codebase calls it — graded CLOSED CH WARN until someone wires it up.
+func unreachableSendAfterClose() { //nolint:unused // deliberately uncalled
+	ch := make(chan int, 1)
+	close(ch)
+	ch <- 1
+}
+
 func drainSquares(n int) int {
 	total := 0
 	for v := range CoordinatedCloseOK(n) {

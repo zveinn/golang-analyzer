@@ -73,7 +73,7 @@ func (a *analyzer) scan(base string) *node {
 func countFindings(n *node) int {
 	c := 0
 	switch n.Kind {
-	case "race", "race-warn", "chan-closed", "fd-leak", "go-leak":
+	case "race", "race-warn", "chan-closed", "chan-closed-warn", "fd-leak", "go-leak":
 		c++
 	}
 	for _, k := range n.Kids {
@@ -710,10 +710,32 @@ func (a *analyzer) sendsAfterCloseInFlow() []finding {
 					}
 					for _, c := range closes {
 						if c.key != nil && c.pos < s.pos && a.find(c.key) == a.find(s.key) {
+							// Concrete only if reaching the send implies the
+							// close ran (every branch arm guarding the close
+							// also guards the send) and the function has
+							// callers.
+							kind := "chan-closed"
+							var reasons []string
+							if !armsSubset(branchArms(fd.Body, c.pos), branchArms(fd.Body, s.pos)) {
+								kind = "chan-closed-warn"
+								reasons = append(reasons,
+									"the close and this send are in different branches — they may be mutually exclusive")
+							}
+							if !a.declReachable(p, f, s.pos) {
+								kind = "chan-closed-warn"
+								reasons = append(reasons,
+									"the enclosing function has no callers in this codebase — needs new calling code to occur")
+							}
 							spans := append([]span{{T: "send on closed channel: "}}, a.exprSpans(p, s.ch)...)
 							spans = append(spans, span{T: " is closed earlier in this function"})
-							n := nodeWithSpans(a.relPos(s.pos), "chan-closed", "", truncateSpans(spans, 90))
+							if kind == "chan-closed-warn" {
+								spans = append(spans, span{T: " — theoretical in the current codebase"})
+							}
+							n := nodeWithSpans(a.relPos(s.pos), kind, "", truncateSpans(spans, 110))
 							n.notep(a.relPos(c.pos), "closed here")
+							for _, r := range reasons {
+								n.note("%s", r)
+							}
 							out = append(out, finding{pos: s.pos, n: n})
 							break
 						}
@@ -773,8 +795,34 @@ func (a *analyzer) multiSenderCloses() []finding {
 			continue
 		}
 		c := closes[0]
-		n := &node{Pos: a.relPos(c.pos), Kind: "chan-closed",
-			Text: fmt.Sprintf("channel closed in %s while %d sender(s) elsewhere may still write to it", c.fn, len(rogue))}
+
+		// Concrete only if both ends can actually run: the closing function
+		// and at least one rogue sender's function are reachable from the
+		// module's entry points.
+		kind := "chan-closed"
+		var reasons []string
+		closerReachable := a.posReachable(c.pos)
+		senderReachable := false
+		for _, s := range rogue {
+			if a.posReachable(s.pos) {
+				senderReachable = true
+				break
+			}
+		}
+		if !closerReachable {
+			kind = "chan-closed-warn"
+			reasons = append(reasons, "the closing function has no callers in this codebase")
+		}
+		if !senderReachable {
+			kind = "chan-closed-warn"
+			reasons = append(reasons, "none of the sending functions have callers in this codebase")
+		}
+
+		text := fmt.Sprintf("channel closed in %s while %d sender(s) elsewhere may still write to it", c.fn, len(rogue))
+		if kind == "chan-closed-warn" {
+			text += " — theoretical in the current codebase"
+		}
+		n := &node{Pos: a.relPos(c.pos), Kind: kind, Text: text}
 		for i, s := range rogue {
 			if i == 5 {
 				n.note("… and %d more senders", len(rogue)-5)
@@ -782,9 +830,22 @@ func (a *analyzer) multiSenderCloses() []finding {
 			}
 			n.notep(a.relPos(s.pos), "sender: %s", s.fn)
 		}
+		for _, r := range reasons {
+			n.note("%s", r)
+		}
 		out = append(out, finding{pos: c.pos, n: n})
 	}
 	return out
+}
+
+// posReachable reports whether the function declaration containing pos is
+// reachable from the module's entry points.
+func (a *analyzer) posReachable(pos token.Pos) bool {
+	p, f := a.fileFor(pos)
+	if f == nil {
+		return true
+	}
+	return a.declReachable(p, f, pos)
 }
 
 // waitGroupWaitBefore reports whether the function enclosing pos calls
