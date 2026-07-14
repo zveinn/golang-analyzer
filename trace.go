@@ -63,8 +63,18 @@ func (a *analyzer) stmt(p *packages.Package, s ast.Stmt, parent *node) {
 	case *ast.ExprStmt:
 		a.expr(p, x.X, parent)
 	case *ast.AssignStmt:
-		for _, e := range x.Rhs {
-			a.expr(p, e, parent)
+		if len(x.Rhs) == 1 {
+			before := len(parent.Kids)
+			a.expr(p, x.Rhs[0], parent)
+			a.prependAssign(p, x.Lhs, x.Rhs[0], parent, before)
+		} else {
+			for i, e := range x.Rhs {
+				before := len(parent.Kids)
+				a.expr(p, e, parent)
+				if i < len(x.Lhs) {
+					a.prependAssign(p, x.Lhs[i:i+1], e, parent, before)
+				}
+			}
 		}
 		for _, e := range x.Lhs {
 			a.expr(p, e, parent)
@@ -155,8 +165,18 @@ func (a *analyzer) stmt(p *packages.Package, s ast.Stmt, parent *node) {
 		if gd, ok := x.Decl.(*ast.GenDecl); ok {
 			for _, spec := range gd.Specs {
 				if vs, ok := spec.(*ast.ValueSpec); ok {
-					for _, v := range vs.Values {
+					names := make([]ast.Expr, len(vs.Names))
+					for i, n := range vs.Names {
+						names[i] = n
+					}
+					for i, v := range vs.Values {
+						before := len(parent.Kids)
 						a.expr(p, v, parent)
+						if len(vs.Values) == 1 {
+							a.prependAssign(p, names, v, parent, before)
+						} else if i < len(names) {
+							a.prependAssign(p, names[i:i+1], v, parent, before)
+						}
 					}
 				}
 			}
@@ -378,6 +398,105 @@ func (a *analyzer) callSpans(p *packages.Package, call *ast.CallExpr) []span {
 	return truncateSpans(a.exprSpans(p, call), 90)
 }
 
+// boundCallSpans renders a local call with the caller→callee name mapping
+// inline — "(rb > r).ReadAlignedFrom(r > rd, size, …)" — so the rename is
+// visible in the call itself instead of on separate "param ← arg" rows. The
+// callee parameter names are marked as variables (same alias-class color as
+// the argument), so they stay clickable/trackable. The mapping is shown only
+// where the parameter name differs from the argument text.
+func (a *analyzer) boundCallSpans(p *packages.Package, call *ast.CallExpr, fn *types.Func) []span {
+	sig := fn.Origin().Signature()
+	var out []span
+	if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok {
+		recvSpans := a.exprSpans(p, sel.X)
+		if recv := sig.Recv(); recv != nil && recv.Name() != "" && recv.Name() != "_" &&
+			spansText(recvSpans) != recv.Name() {
+			out = append(out, span{T: "("})
+			out = append(out, recvSpans...)
+			out = append(out, span{T: " > "}, span{T: recv.Name(), V: a.varID(recv)}, span{T: ")."})
+		} else {
+			out = append(out, recvSpans...)
+			out = append(out, span{T: "."})
+		}
+		out = append(out, span{T: sel.Sel.Name})
+	} else {
+		out = append(out, a.exprSpans(p, call.Fun)...)
+	}
+	out = append(out, span{T: "("})
+	for i, arg := range call.Args {
+		if i > 0 {
+			out = append(out, span{T: ", "})
+		}
+		argSpans := a.exprSpans(p, arg)
+		out = append(out, argSpans...)
+		variadicTail := sig.Variadic() && i >= sig.Params().Len()-1
+		if i < sig.Params().Len() && !variadicTail {
+			if param := sig.Params().At(i); param.Name() != "" && param.Name() != "_" &&
+				spansText(argSpans) != param.Name() {
+				out = append(out, span{T: " > "}, span{T: param.Name(), V: a.varID(param)})
+			}
+		}
+	}
+	if call.Ellipsis.IsValid() {
+		out = append(out, span{T: "…"})
+	}
+	out = append(out, span{T: ")"})
+	return truncateSpans(out, 120)
+}
+
+// callKinds are the node kinds that render a call expression.
+var callKinds = map[string]bool{
+	"call": true, "interface-call": true, "func-value-call": true, "indirect-call": true,
+}
+
+// prependAssign shows the variable(s) that capture a call's result inline on
+// the call row ("rb = (…).WithOtel(ctx)"), so a trackable value's creation
+// point is visible instead of appearing out of nowhere at later uses. It only
+// fires when the rhs is itself a call and produced a call node.
+func (a *analyzer) prependAssign(p *packages.Package, lhs []ast.Expr, rhs ast.Expr, parent *node, before int) {
+	if _, ok := ast.Unparen(rhs).(*ast.CallExpr); !ok {
+		return
+	}
+	if len(parent.Kids) <= before {
+		return
+	}
+	target := parent.Kids[before]
+	if !callKinds[target.Kind] {
+		return
+	}
+	lhsSpans := a.lhsSpans(p, lhs)
+	if lhsSpans == nil {
+		return
+	}
+	spans := make([]span, 0, len(lhsSpans)+1+len(target.Spans))
+	spans = append(spans, lhsSpans...)
+	spans = append(spans, span{T: " = "})
+	spans = append(spans, target.Spans...)
+	target.Spans = spans
+	target.Text = spansText(spans)
+}
+
+// lhsSpans renders assignment targets ("rb", "x, y") as trackable variable
+// spans, skipping blank identifiers. Returns nil if nothing is trackable.
+func (a *analyzer) lhsSpans(p *packages.Package, lhs []ast.Expr) []span {
+	var out []span
+	n := 0
+	for _, l := range lhs {
+		if id, ok := ast.Unparen(l).(*ast.Ident); ok && id.Name == "_" {
+			continue
+		}
+		if n > 0 {
+			out = append(out, span{T: ", "})
+		}
+		out = append(out, a.exprSpans(p, l)...)
+		n++
+	}
+	if n == 0 {
+		return nil
+	}
+	return out
+}
+
 // staticCall handles a call whose target is a known function or method.
 func (a *analyzer) staticCall(p *packages.Package, call *ast.CallExpr, fn *types.Func, parent *node) {
 	if recv := fn.Signature().Recv(); recv != nil && types.IsInterface(recv.Type()) {
@@ -385,7 +504,13 @@ func (a *analyzer) staticCall(p *packages.Package, call *ast.CallExpr, fn *types
 		return
 	}
 	label := a.classify(fn.Pkg())
-	spans := a.callSpans(p, call)
+	_, hasBody := a.funcs[fn.Origin()]
+	var spans []span
+	if label == "local" && hasBody {
+		spans = a.boundCallSpans(p, call, fn)
+	} else {
+		spans = a.callSpans(p, call)
+	}
 	if inst := a.instanceSuffix(p, call); inst != "" {
 		spans = append(spans, span{T: " " + inst})
 	}
@@ -592,19 +717,13 @@ func (a *analyzer) expandLit(p *packages.Package, lit *ast.FuncLit, at string, n
 	a.litDepth--
 }
 
-// walkArgs traces calls nested in the arguments and annotates them: for
-// local callees with a known body, arguments are shown as parameter
-// bindings ("dir ← filepath.Dir(absFile)"); otherwise as origin
-// annotations ("absFile ← parameter ...").
+// walkArgs traces calls nested in the arguments and annotates them with an
+// origin row ("x ← make(…)") where the value was allocated. The caller→callee
+// name mapping is rendered inline in the call itself (see boundCallSpans), so
+// no separate "param ← arg" rows are emitted here.
 func (a *analyzer) walkArgs(p *packages.Package, call *ast.CallExpr, fn *types.Func, n *node) {
 	for _, arg := range call.Args {
 		a.expr(p, arg, n)
-	}
-	if fn != nil && a.classify(fn.Pkg()) == "local" {
-		if _, ok := a.funcs[fn.Origin()]; ok {
-			a.bindParams(p, call, fn, n)
-			return
-		}
 	}
 	for _, arg := range call.Args {
 		a.annotateArg(p, arg, n)

@@ -234,54 +234,6 @@ func (a *analyzer) annotateReturn(p *packages.Package, x *ast.ReturnStmt, parent
 	}
 }
 
-// bindParams emits one "param ← argument" row per parameter of a local
-// call, making the caller→callee renaming visible and trackable: expanding
-// findModuleRoot(filepath.Dir(absFile)) shows `dir ← filepath.Dir(absFile)`
-// with both sides clickable. When the argument is a plain variable with a
-// known origin, the origin is appended.
-func (a *analyzer) bindParams(p *packages.Package, call *ast.CallExpr, fn *types.Func, parent *node) {
-	sig := fn.Origin().Signature()
-	if recv := sig.Recv(); recv != nil && recv.Name() != "" && recv.Name() != "_" {
-		if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok {
-			recvSpans := truncateSpans(a.exprSpans(p, sel.X), 40)
-			if spansText(recvSpans) != recv.Name() { // skip no-op rows like "p ← p"
-				spans := append([]span{{T: recv.Name(), V: a.varID(recv)}, {T: " ← "}}, recvSpans...)
-				parent.add(nodeWithSpans(a.relPos(recv.Pos()), "param", "", spans))
-			}
-		}
-	}
-	for i, arg := range call.Args {
-		if i >= sig.Params().Len() || (sig.Variadic() && i >= sig.Params().Len()-1) {
-			a.annotateArg(p, arg, parent)
-			continue
-		}
-		param := sig.Params().At(i)
-		if param.Name() == "" || param.Name() == "_" {
-			a.annotateArg(p, arg, parent)
-			continue
-		}
-		spans := append([]span{{T: param.Name(), V: a.varID(param)}, {T: " ← "}},
-			truncateSpans(a.exprSpans(p, arg), 45)...)
-		pos := a.relPos(param.Pos())
-		if id, ok := ast.Unparen(unwrapAddr(arg)).(*ast.Ident); ok {
-			if v, ok := p.TypesInfo.Uses[id].(*types.Var); ok {
-				if desc, at, ok := a.describeVarOrigin(v); ok {
-					spans = append(append(spans, span{T: " — "}), desc...)
-					pos = at
-				}
-			}
-		}
-		parent.add(nodeWithSpans(pos, "param", "", spans))
-	}
-}
-
-func unwrapAddr(e ast.Expr) ast.Expr {
-	if u, ok := ast.Unparen(e).(*ast.UnaryExpr); ok && u.Op == token.AND {
-		return u.X
-	}
-	return e
-}
-
 // describeVarOrigin explains where a variable came from: parameter,
 // make/new, composite literal, call result, etc. The description is
 // returned as spans so variables inside it stay trackable.
@@ -296,13 +248,15 @@ func (a *analyzer) describeVarOrigin(v *types.Var) (desc []span, at string, ok b
 		if v.IsField() {
 			return []span{{T: "struct field " + v.Name()}}, at, true
 		}
-		role := "parameter"
+		// A named result is worth labeling (it's the function's declared
+		// output), but a plain parameter's provenance is already conveyed by
+		// the variable's tracking color — it links to the same-colored
+		// argument at the call site — so we don't spell out "parameter X of …".
 		if fd := enclosingFuncDecl(site.file, d.Pos()); fd != nil && fd.Type.Results != nil &&
 			d.Pos() >= fd.Type.Results.Pos() && d.End() <= fd.Type.Results.End() {
-			role = "named result"
+			return []span{{T: fmt.Sprintf("named result %q", v.Name())}}, at, true
 		}
-		return []span{{T: fmt.Sprintf("%s %q of %s", role, v.Name(),
-			a.enclosingFuncName(site.pkg, site.file, site.node.Pos()))}}, at, true
+		return nil, "", false
 	case *ast.AssignStmt:
 		return a.describeAssignRHS(site.pkg, d, v), at, true
 	case *ast.ValueSpec:

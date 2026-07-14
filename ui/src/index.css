@@ -308,8 +308,8 @@ body {
 
 .row {
   display: grid;
-  grid-template-columns: 230px 1fr;
-  line-height: 1.65;
+  grid-template-columns: 200px 1fr;
+  line-height: 1.55;
   white-space: nowrap;
 }
 
@@ -453,10 +453,38 @@ body {
 }
 
 .b-arg,
-.b-peer,
-.b-note {
+.b-peer {
   background: color-mix(in srgb, var(--dim) 14%, transparent);
   color: var(--dim);
+}
+
+/* note marker: a bare dim glyph, no pill. */
+.b-note {
+  background: none;
+  color: var(--dimmer);
+  padding: 0;
+}
+
+/* code keywords rendered inline instead of badges — reads like source. */
+.kw {
+  font-weight: 600;
+  margin-right: 5px;
+}
+
+.kw-go {
+  color: var(--amber);
+}
+
+.kw-defer {
+  color: var(--orange);
+}
+
+.kw-select {
+  color: var(--cyan);
+}
+
+.kw-return {
+  color: var(--err);
 }
 
 .b-race {
@@ -600,12 +628,9 @@ body {
 
 .k-note .text,
 .k-arg .text,
+.k-param .text,
 .k-peer .text {
   color: var(--dim);
-}
-
-.k-go .text {
-  color: var(--amber);
 }
 
 .k-chan-send .text {

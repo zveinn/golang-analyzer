@@ -33,6 +33,17 @@ const BADGES = {
 
 const VAR_PALETTE_SIZE = 10
 
+// Kinds rendered as a leading code keyword rather than a badge.
+const KW = { go: 'go', defer: 'defer', select: 'select', return: 'return' }
+
+// Kinds whose meaning is already carried by the row text (a keyword, an arrow,
+// or the "←" of an annotation), so a badge would just add noise.
+const HIDE_BADGE = new Set([
+  'go', 'defer', 'select', 'return',
+  'chan-send', 'chan-recv', 'chan-close',
+  'arg', 'param', 'peer',
+])
+
 function walk(n, fn) {
   fn(n)
   n.kids?.forEach((k) => walk(k, fn))
@@ -186,37 +197,64 @@ export default function TraceView({ trace }) {
       </div>
 
       <div className="legend">
-        <span className="chip label-local">local</span> traced into ·{' '}
         <span className="chip label-stdlib">stdlib</span> /{' '}
-        <span className="chip label-module">module</span> labeled only ·{' '}
-        <span className="badge b-go">go</span> goroutine ·{' '}
-        <span className="badge b-send">send</span>
-        <span className="badge b-recv">recv</span> channel ops ·{' '}
-        <span className="var v3 legend-var">variable</span> click to track through the trace ·{' '}
-        <span className="badge b-return">return</span>
-        <span className="var v0 legend-var var-ret">value</span> returned variable
+        <span className="chip label-module">module</span> not traced into ·{' '}
+        <span className="kw kw-go">go</span>
+        <span className="kw kw-defer">defer</span>
+        <span className="kw kw-return">return</span> keywords ·{' '}
+        <span className="var v3 legend-var">variable</span> click to track ·{' '}
+        <span className="var v0 legend-var var-ret">value</span> returned
       </div>
     </div>
   )
 }
 
+function VarSpan({ s, tracked, onVarClick }) {
+  return (
+    <button
+      className={`var v${s.v % VAR_PALETTE_SIZE} ${tracked?.v === s.v ? 'var-sel' : ''} ${s.r ? 'var-ret' : ''}`}
+      title={s.r ? 'returned value · click to track' : 'click to track this variable'}
+      onClick={(e) => {
+        e.stopPropagation()
+        onVarClick(s.v, s.t)
+      }}
+    >
+      {s.t}
+    </button>
+  )
+}
+
 function NodeText({ n, tracked, onVarClick }) {
-  if (!n.spans) return <span className="text">{n.text}</span>
+  const kw = KW[n.kind]
+  const keyword = kw ? <span className={`kw kw-${n.kind}`}>{kw}</span> : null
+
+  // Plain-text node (no variable spans), e.g. defer/select/note.
+  if (!n.spans) {
+    const rest = kw && n.text.trim() === kw ? '' : n.text
+    return (
+      <span className="text">
+        {keyword}
+        {rest}
+      </span>
+    )
+  }
+
+  // Strip a leading keyword already present in the text so it isn't shown
+  // twice (the colored keyword token replaces it).
+  let spans = n.spans
+  if (kw && spans.length && !spans[0].v) {
+    const trimmed = spans[0].t.replace(/^\s+/, '')
+    if (trimmed.startsWith(kw)) {
+      spans = [{ ...spans[0], t: trimmed.slice(kw.length).replace(/^\s+/, '') }, ...spans.slice(1)]
+    }
+  }
+
   return (
     <span className="text">
-      {n.spans.map((s, i) =>
+      {keyword}
+      {spans.map((s, i) =>
         s.v ? (
-          <button
-            key={i}
-            className={`var v${s.v % VAR_PALETTE_SIZE} ${tracked?.v === s.v ? 'var-sel' : ''} ${s.r ? 'var-ret' : ''}`}
-            title={s.r ? 'returned value · click to track' : 'click to track this variable'}
-            onClick={(e) => {
-              e.stopPropagation()
-              onVarClick(s.v, s.t)
-            }}
-          >
-            {s.t}
-          </button>
+          <VarSpan key={i} s={s} tracked={tracked} onVarClick={onVarClick} />
         ) : (
           <span key={i}>{s.t}</span>
         ),
@@ -230,6 +268,7 @@ function Row({ n, depth, collapsed, onToggle, visible, tracked, onVarClick }) {
   const kids = n.kids ?? []
   const isCollapsed = !visible && collapsed.has(n._id)
   const badge = BADGES[n.kind]
+  const showBadge = badge && !HIDE_BADGE.has(n.kind)
   const badgeText = n.kind === 'loop' && n.num ? `loop ${n.num}` : badge?.text
   const hit = tracked && nodeHasVar(n, tracked.v)
 
@@ -247,7 +286,7 @@ function Row({ n, depth, collapsed, onToggle, visible, tracked, onVarClick }) {
           ) : (
             <span className="disc spacer" />
           )}
-          {badge && <span className={`badge ${badge.cls}`}>{badgeText}</span>}
+          {showBadge && <span className={`badge ${badge.cls}`}>{badgeText}</span>}
           <NodeText n={n} tracked={tracked} onVarClick={onVarClick} />
           {n.label && <span className={`chip label-${n.label}`}>{n.label}</span>}
           {isCollapsed && <span className="hidden-count">+{countSubtree(n) - 1} hidden</span>}
