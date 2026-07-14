@@ -1,0 +1,199 @@
+── SYSTEM MEMORY OVERVIEW ──────────────────────────────────────────────────
+  Total RAM            377.2 GB
+  Free                  28.8 GB  (7.6% of RAM)
+  Available             25.3 GB  (6.7% of RAM)
+  Page cache            13.6 GB  (3.6% of RAM)
+  Buffers               17.5 MB  (0.0% of RAM)
+  Anonymous             12.9 GB  (3.4% of RAM)
+  Shmem                  7.4 MB  (0.0% of RAM)
+  Unevictable           30.7 MB  (0.0% of RAM)
+    mlocked             27.7 MB  (0.0% of RAM)
+  Hugetlb                 0.0 B  (0.0% of RAM)
+  Slab total            18.8 GB  (5.0% of RAM)
+    reclaimable         17.1 GB  (4.5% of RAM)
+    unreclaimable        1.7 GB  (0.5% of RAM)
+  Page tables           97.1 MB  (0.0% of RAM)
+  Kernel stacks         40.2 MB  (0.0% of RAM)
+  Vmalloc used         535.8 MB  (0.1% of RAM)
+  Percpu                55.2 MB  (0.0% of RAM)
+  Swap total             8.0 GB
+  Swap free              8.0 GB
+  Other                302.3 GB  (drivers, alloc_pages, untracked)
+
+── SLAB CACHES (top 15 by size) ────────────────────────────────────────────
+  NAME                               SIZE   USE%        OBJECTS  OBJSIZE R/U  MERGED-WITH
+  xfs_buf                          9.1 GB  89.1%       25075970     384B   R  
+  xfs_inode                        4.8 GB  51.2%        5017364    1024B   R  
+  radix_tree_node                  2.7 GB  71.7%        4974816     584B   R  
+  kmalloc-32                     651.4 MB  88.5%       21344768      32B   U  
+  dentry                         347.3 MB  51.3%        1867194     192B   R  
+  shared_policy_node             278.7 MB  42.9%        6063475      48B   U  Acpi-Namespace,ksm_mm_slot,lsm_inode_cache,xfs_ifork,xfs_...
+  kmalloc-rnd-04-256             234.5 MB  35.2%         960352     256B   U  
+  xfs_ili                         87.6 MB  69.2%         448320     200B   R  
+  kmalloc-rnd-06-512              84.4 MB  51.8%         172800     512B   U  
+  kmalloc-rnd-13-16               49.4 MB  54.7%        3235840      16B   U  
+  kmalloc-rcl-96                  38.3 MB  50.2%         412272      96B   R  
+  kmalloc-rnd-04-512              36.4 MB  77.9%          74528     512B   U  
+  kmalloc-rnd-14-1k               34.8 MB  99.8%          35648    1024B   U  
+  task_struct                     29.1 MB  99.3%           2790   10432B   U  
+  kmalloc-rnd-02-32               26.5 MB  80.7%         867840      32B   U  
+  by flag: reclaimable 17.1 GB · unreclaimable 1.7 GB
+
+── LOCKSTEP OBJECT COUNTS ──────────────────────────────────────────────────
+  ~5017364 objects each: xfs_inode(5017364), radix_tree_node(4974816)
+  counts within 3% ⇒ one of each per parent object; freed together
+
+── TOP 3 CULPRIT ANALYSIS ──────────────────────────────────────────────────
+  ## xfs_buf  9.1 GB in 25075970 objs of 384B [R]
+     [ ok ] not merged — struct = xfs_buf
+     alloc_calls: n/a — boot with slub_debug=U for historical attribution
+  ## xfs_inode  4.8 GB in 5017364 objs of 1024B [R]
+     [ ok ] not merged — struct = xfs_inode
+     alloc_calls: n/a — boot with slub_debug=U for historical attribution
+  ## radix_tree_node  2.7 GB in 4974816 objs of 584B [R]
+     [ ok ] not merged — struct = radix_tree_node
+     alloc_calls: n/a — boot with slub_debug=U for historical attribution
+
+── DENTRY STATE ────────────────────────────────────────────────────────────
+  total 955352 · unused (LRU) 443883 · negative 101938
+  negative dentries cache failed lookups; they are pure overhead beyond a point
+
+── PROCESS ALLOCATIONS (oom_badness kill order, top 20) ────────────────────
+    # NAME                        PID        RSS        PSS    LOCKED      SWAP    PGTBL    ADJ    BADNESS BPF/PERF
+    1 minio                   2073439    12.7 GB    12.7 GB     0.0 B     0.0 B  90.5 MB      0    3350704         
+    2 splunkd                    3512   125.3 MB   119.1 MB     0.0 B     0.0 B 856.0 KB      0      32295         
+    3 puppet                  3644840    96.1 MB    93.6 MB     0.0 B     0.0 B 368.0 KB      0      24704         
+    4 networkd-dispat            1495    12.6 MB     9.1 MB     0.0 B     0.0 B 108.0 KB      0       3248         
+    5 sssd_be                    1667    12.3 MB     6.5 MB     0.0 B     0.0 B 136.0 KB      0       3183         
+    6 sssd_pam                3749515    12.2 MB     4.5 MB     0.0 B     0.0 B 100.0 KB      0       3158         
+    7 sssd_ssh                3749512    12.1 MB     4.2 MB     0.0 B     0.0 B 104.0 KB      0       3118         
+    8 unattended-upgr            1915    11.5 MB     8.2 MB     0.0 B     0.0 B 120.0 KB      0       2986         
+    9 splunkd                    3520    11.3 MB     6.4 MB     0.0 B     0.0 B 160.0 KB      0       2934         
+   10 sshd                    3749580    10.1 MB     2.4 MB     0.0 B     0.0 B  92.0 KB      0       2617         
+   11 sshd                    3742069    10.0 MB     2.4 MB     0.0 B     0.0 B  92.0 KB      0       2587         
+   12 systemd                       1    10.0 MB     7.0 MB     0.0 B     0.0 B  92.0 KB      0       2582       13
+   13 pmcd                       1758     9.4 MB     6.8 MB     0.0 B     0.0 B  72.0 KB      0       2420         
+   14 sssd_nss                   1891     9.3 MB     4.2 MB     0.0 B     0.0 B 160.0 KB      0       2415         
+   15 packagekitd               80809     8.5 MB     4.5 MB     0.0 B     0.0 B 168.0 KB      0       2228         
+   16 memory-analysis         3750196     8.5 MB     8.9 MB     0.0 B     0.0 B 112.0 KB      0       2200         
+   17 pmlogger                   2637     8.0 MB     4.7 MB     0.0 B     0.0 B  68.0 KB      0       2068         
+   18 pmdaproc                   1800     7.6 MB     4.6 MB     0.0 B     0.0 B  72.0 KB      0       1958         
+   19 sshd                    3749622     7.4 MB     2.1 MB     0.0 B     0.0 B  80.0 KB      0       1917         
+   20 sshd                    3742120     7.3 MB     2.1 MB     0.0 B     0.0 B  80.0 KB      0       1898         
+  TOTAL userspace across 64 processes: RSS 13.3 GB, swap 0.0 B
+  PSS splits shared pages between mappers (RSS double-counts them); LOCKED is unreclaimable
+  kernel slab is charged to no process — if slab dominates, rank #1 is not the real consumer
+
+── SLAB BY CGROUP (who got charged) ────────────────────────────────────────
+  CGROUP                                                       SLAB       UNRECL  PIDS
+  /                                                          3.4 GB      29.1 MB  kthreadd(2) pool_workqueue_release(3) kworker/R-rcu_g(4)
+  system.slice                                               3.4 GB      28.4 MB  
+    system.slice/minio.service                               3.4 GB      20.9 MB  minio(2073439)
+  charged to cgroups: 3.4 GB of 18.8 GB total slab · 15.4 GB unaccounted (kernel-internal, IRQ, !SLAB_ACCOUNT caches)
+  values are hierarchical (children included in parents); charge goes to the
+  allocating cgroup — objects can outlive it (offline memcgs stay charged)
+
+── PER-NUMA-NODE MEMORY ────────────────────────────────────────────────────
+  NODE          TOTAL         FREE  FREE%         FILE         ANON         SLAB
+  0          188.2 GB      12.8 GB   6.8%       1.9 GB      10.7 GB       9.4 GB
+  1          189.0 GB      15.9 GB   8.4%      11.7 GB       2.2 GB       9.4 GB
+  OOM is decided per node — one exhausted node kills with memory free elsewhere
+
+── SHRINKERS (reclaimable objects per cache type, debugfs) ─────────────────
+  debugfs unreadable (need root) — check manually:
+    ls /sys/kernel/debug/shrinker/ | grep xfs-buf     # one per drive
+    cat /sys/kernel/debug/shrinker/xfs-buf:*/count    # reclaimable buffers per drive
+
+── PRESSURE STALL INFORMATION (PSI) ────────────────────────────────────────
+  % of wall time stalled: some = ≥1 task · full = all non-idle tasks
+  memory   some   0.00% /  0.02% /  0.03%   full   0.00% /  0.02% /  0.02%   (10s/60s/300s)
+  io       some   0.02% /  0.06% /  0.21%   full   0.02% /  0.06% /  0.18%   (10s/60s/300s)
+
+── KERNEL VM SETTINGS ──────────────────────────────────────────────────────
+  vm.min_free_kbytes                2097152  reclaim starts below this; too low = allocation stalls under bursts
+  vm.watermark_scale_factor             125  distance between reclaim watermarks (units of 0.01% of RAM)
+  vm.swappiness                           0  willingness to swap anon vs drop file cache
+  vm.vfs_cache_pressure                 200  reclaim aggressiveness for dentry/inode caches (100 = neutral)
+  vm.zone_reclaim_mode                    0  nonzero = nodes reclaim locally before using other nodes
+  vm.overcommit_memory                    0  0 heuristic · 1 always · 2 strict commit limit
+  vm.dirty_background_ratio              10  background writeback starts (% of dirtyable memory)
+  vm.dirty_ratio                         20  writers are throttled above this (% of dirtyable memory)
+  transparent_hugepage              madvise  THP mode
+  Committed_AS / CommitLimit          13.1%  45.7 GB of 347.5 GB
+  dirty now / throttle at            2.0 MB  throttle 8.5 GB · background 4.2 GB
+
+── NETWORK MEMORY ──────────────────────────────────────────────────────────
+  TCP buffers 14.4 MB (101 sockets in use, 0 orphaned) · UDP buffers 0.0 B
+  tcp_mem: pressure at 23.5 GB · hard max 35.3 GB
+
+── WRITEBACK BY DEVICE (bdi) ───────────────────────────────────────────────
+  [ ok ] no dirty data pending on any device
+
+── KERNEL ALLOCATION PROFILING (/proc/allocinfo) ───────────────────────────
+  unavailable — needs kernel ≥6.10 with CONFIG_MEM_ALLOC_PROFILING
+  (boot with mem_profiling=1); this is the definitive per-callsite
+  accounting of ALL kernel memory, including raw page allocations
+
+── PHYSICAL FRAGMENTATION (buddy allocator) ────────────────────────────────
+  free blocks per order, usable by normal allocations (HighAtomic/CMA excluded)
+  ZONE            4K     8K    16K    32K    64K   128K   256K   512K     1M     2M     4M  LARGEST
+  n0 DMA           0      0      0      0      0      0      0      0      1      1      2   4.0 MB
+  n0 DMA32      1175   1178   2061   1679   1447    928    603    245    127     25      0   2.0 MB
+  n0 Normal    33200  36653  24693   9469   1203     35      0      0      0      0      0  128.0 KB
+  n1 Normal    70094  20202  12726    207      7      0      0      0      0      0      0  64.0 KB
+  n0 DMA      pageblocks 38% Unmovable (slab/kernel — compaction cannot fix)
+  n0 DMA32    pageblocks 29% Unmovable (slab/kernel — compaction cannot fix)
+  n0 Normal   HighAtomic reserve 891.4 MB (off-limits to normal allocations) · pageblocks 87% Unmovable (slab/kernel — compaction cannot fix)
+  n1 Normal   HighAtomic reserve 471.7 MB (off-limits to normal allocations) · pageblocks 87% Unmovable (slab/kernel — compaction cannot fix)
+  compaction since boot: stalls 16674346 · success 2441302 · fail 14233044
+
+── OOM KILL FORENSICS (kernel log) ─────────────────────────────────────────
+  [ ok ] no OOM kills since boot
+
+---- tracing culprit-size allocations for 10s ----
+
+── CULPRIT GROWTH over 10s ─────────────────────────────────────────────────
+  xfs_buf                              +0 objs         0.0 B  flat
+  xfs_inode                            +0 objs         0.0 B  flat
+  radix_tree_node                      +0 objs         0.0 B  flat
+
+── LIVE ALLOCATION ATTRIBUTION (10s sample) ────────────────────────────────
+  ## 384B size class (reported as "xfs_buf")
+            432 allocs (      43/s)  _xfs_buf_alloc                            by: minio:2073439(430) kworker/6:0:3748907(1) kworker/1:0:3748931(1)
+            129 allocs (      13/s)  inet_reqsk_alloc                          by: <idle>(116) minio:2073439(13)
+  ## 584B size class (reported as "radix_tree_node")
+           6389 allocs (     639/s)  radix_tree_node_alloc.constprop.0         by: minio:2073439(6389)
+            475 allocs (      48/s)  xas_alloc                                 by: minio:2073439(475)
+  ## 1024B size class (reported as "xfs_inode")
+          13448 allocs (    1345/s)  xfs_inode_alloc                           by: minio:2073439(13443) <...>:2073439(4) splunkd:3512(1)
+           7610 allocs (     761/s)  xlog_cil_alloc_shadow_bufs.constprop.0    by: minio:2073439(5951) kworker/23:3:3748293(122) kworker/20:1:3749162(120) ...
+            654 allocs (      65/s)  free_iova_fast                            by: <idle>(467) minio:2073439(172) memory-analysis:3750196(15)
+            127 allocs (      13/s)  mempool_alloc_slab                        by: minio:2073439(88) kworker/u65:2:3746163(13) kworker/u65:4:3748680(12) ...
+            124 allocs (      12/s)  bvec_alloc                                by: minio:2073439(124)
+             48 allocs (       5/s)  kvmalloc_node                             by: minio:2073439(48)
+              1 allocs (       0/s)  __seq_open_private                        by: memory-analysis:3750196(1)
+  the kernel function IS the exact owner, whatever the merged class is called
+
+── SUMMARY ─────────────────────────────────────────────────────────────────
+  [ ok ] slab 18.8 GB = 5.0% of RAM  (R 17.1 GB / U 1.7 GB)
+  [CRIT] available 25.3 GB = 6.7% of RAM
+  [info] biggest slab: xfs_buf  9.1 GB, 25075970 objs
+  [info] lockstep ~5017364 objs: xfs_inode, radix_tree_node (per-object companions, freed together)
+  [ ok ] zone Normal(n0): contiguous up to order 5 (128.0 KB)
+  [info] highatomic reserve fences off 891.4 MB
+  [ ok ] zone Normal(n1): contiguous up to order 4 (64.0 KB)
+  [info] highatomic reserve fences off 471.7 MB
+  [info] 1024B allocs ← xfs_inode_alloc (13448 in window)
+  [info] 584B allocs ← radix_tree_node_alloc.constprop.0 (6389 in window)
+  [info] 384B allocs ← _xfs_buf_alloc (432 in window)
+  [info] next OOM victim: minio pid 2073439 (rss 12.7 GB, oom_score_adj 0)
+  [WARN] slab 18.8 GB > all userspace 13.3 GB — killing processes cannot help
+  hints: slub_nomerge = exact slab names · slub_debug=U = historical alloc_calls
+── WARNINGS ────────────────────────────────────────────────────────────────
+  [CRIT] MemAvailable is 25.3 GB (6.7% of RAM)
+         → MemAvailable does not count shrinker-held memory (xfs-buf etc.) — the true headroom may be larger; verify with the shrinker section
+  [WARN] 302.3 GB (80% of RAM) is in no meminfo category
+         → kernel memory outside every meminfo category — see SHRINKERS (xfs-buf data pages live here) and /proc/allocinfo; GPU/dma-buf also lands here
+  [WARN] HardwareCorrupted: 12.0 KB of RAM offlined
+         → the kernel has retired pages for memory errors — check EDAC counters / mcelog / BMC event log
+

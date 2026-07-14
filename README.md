@@ -62,6 +62,65 @@ Supported parameters:
 | `depth` | positive integer | max call-expansion depth (default 40) |
 | `expand` | `once` (default) / `all` | expand each function body once per trace, or at every call site |
 
+## Editor integration
+
+The TCP client is a good fit for an editor keybinding: bind a key to run
+`client <current-file> <current-line>` to trace the function under the cursor
+(the trace opens in the web UI on :1111), or `client scan <dir>` to scan the
+repo. The examples below assume the client is installed as `code-analyzer` on
+your `$PATH` (e.g. `go build -o /usr/local/bin/code-analyzer ./client`).
+
+### Helix
+
+In `~/.config/helix/config.toml`, bind keys under `[keys.normal.space]` (or a
+namespace of your choice):
+
+```toml
+[keys.normal.space]
+2 = ":sh /usr/local/bin/code-analyzer %sh{pwd}/%{buffer_name} %{cursor_line}"
+1 = ":sh /usr/local/bin/code-analyzer scan %sh{pwd}"
+```
+
+`space 2` traces the function under the cursor; `space 1` scans the working
+directory. The client absolutizes paths, so the `%sh{pwd}/` prefix keeps
+relative buffer names resolvable from Helix's working directory.
+
+### Neovim
+
+In your `init.lua` (Neovim 0.10+, uses async `vim.system`):
+
+```lua
+local CLIENT = "/usr/local/bin/code-analyzer"
+
+-- <leader>ca: trace the function under the cursor
+vim.keymap.set("n", "<leader>ca", function()
+  local file = vim.fn.expand("%:p")   -- absolute path of current buffer
+  if file == "" then
+    vim.notify("code-analyzer: no file in buffer", vim.log.levels.WARN)
+    return
+  end
+  vim.system({ CLIENT, file, tostring(vim.fn.line(".")) }, { text = true }, function(res)
+    local msg = ((res.stdout ~= "" and res.stdout or res.stderr) or ""):gsub("%s+$", "")
+    vim.schedule(function()
+      vim.notify("code-analyzer: " .. msg,
+        res.code == 0 and vim.log.levels.INFO or vim.log.levels.ERROR)
+    end)
+  end)
+end, { desc = "code-analyzer: trace function under cursor" })
+
+-- <leader>cs: scan the current buffer's directory
+vim.keymap.set("n", "<leader>cs", function()
+  vim.system({ CLIENT, "scan", vim.fn.expand("%:p:h") }, { text = true }, function(res)
+    local msg = ((res.stdout ~= "" and res.stdout or res.stderr) or ""):gsub("%s+$", "")
+    vim.schedule(function() vim.notify("code-analyzer: " .. msg) end)
+  end)
+end, { desc = "code-analyzer: scan repo" })
+```
+
+Both editors just fire the request at the running server and surface the
+one-line ack; the resulting trace/scan renders in the web UI. Set
+`CODE_ANALYZER_ADDR` if the server isn't on the default `127.0.0.1:1112`.
+
 ## Wire format
 
 Each websocket message is one envelope:
@@ -95,14 +154,20 @@ same navigable tree, with per-category counts and evidence rows:
 
 | Finding | Heuristic |
 | --- | --- |
-| **potential data races** | a variable captured by a `go func(){…}` closure that is written on one side of the goroutine boundary and accessed on the other, with no channel/sync/atomic/context type involved. Range and loop-local variables are per-iteration (Go ≥ 1.22), accesses before the launching loop happen-before every launch, and accesses after a `wg.Wait()` that joins the goroutine (it calls `Done` on the same WaitGroup) are synchronized and not reported at all. Findings are graded — **RACE** is reserved for races concrete in the current codebase: the goroutine is launched in a loop and writes (its instances race each other), or some conflicting access executes unconditionally given the launch, *and* the enclosing function is reachable from the module's entry points (main/init/exported/methods/package-level references). Everything theoretical is **RACE WARN** with the reason: branch-guarded (possibly mutually exclusive conditions) or unreachable (no callers in this codebase — needs new calling code to occur). |
+| **potential data races** | a variable captured by a `go func(){…}` closure that is written on one side of the goroutine boundary and accessed on the other. Not reported at all (synchronized): accesses after a `wg.Wait()`/channel-receive that joins the goroutine, variables mediated entirely by `sync/atomic` calls, per-iteration loop variables (Go ≥ 1.22), accesses before the launching loop, and header-only reads (`len`/`cap`/keyless `range`) beside element writes. Findings are graded — **RACE** is reserved for races concrete in the current codebase; **RACE WARN** marks theoretical ones with the reason: **index-sharded fan-out** (each instance writes a distinct slice element — the dsync `releaseAll` pattern), **mutex-serialized** accesses (same lock class on both sides; pairing not verified), writes inside **sync.Once.Do**, **branch-exclusive** launch/access (possibly mutually exclusive conditions), or an **unreachable** enclosing function (no callers in this codebase). Concurrent map writes are never sharding-safe and stay RACE. A loop-reused variable (`for v = range …`) whose address escapes each iteration into a call, send or struct literal is flagged **RACE WARN**. `examples/theoretical` is a corpus of Warn/Concrete/Safe specimens exercising every grade. |
 | **writes to closed channels** | a send following a `close` of the same channel in one sequential function flow, and channels closed by a function that isn't one of their senders while senders exist elsewhere (closes preceded by `sync.WaitGroup.Wait` count as coordinated). Graded like races — **CLOSED CH** when concrete: reaching the send implies the close ran (branch arms) and, for cross-function cases, both the closer and at least one sender are reachable from the module's entry points; **CLOSED CH WARN** when the close and send sit in possibly mutually exclusive branches or an endpoint has no callers in this codebase. |
-| **unclosed file handles** | `*os.File` values bound to a variable whose alias class is never `Close()`d anywhere in the module and never returned to a caller. |
-| **potential goroutine leaks** | goroutines blocking on a channel op with no counterpart anywhere in the module (ops inside multi-case selects are exempt), and goroutines spinning in an infinite loop with no return, break or channel wait. |
+| **unclosed file handles** | `*os.File` values bound to a variable whose alias class is never `Close()`d anywhere in the module and never returned to a caller. **FD LEAK WARN** when a `Close` exists on the main path but early returns between the open and the close (or its `defer` registration) skip it — the open's immediate error guard is exempt. |
+| **potential goroutine leaks** | goroutines blocking on a channel op with no counterpart anywhere in the module (ops inside multi-case selects are exempt), and goroutines spinning in a call-free infinite loop. Graded: **LEAK** only for purely local channels whose counterpart provably doesn't exist; **LEAK WARN** when the counterpart is merely unverifiable (channel is a parameter, struct field or return value; buffered sends; channels behind pointers; unreachable functions). Externally-owned channels (`ctx.Done()`, `ticker.C`, `time.After`, library-returned, `signal.Notify`) are not leak evidence at all. |
 
-The detectors are heuristics — findings are labeled "potential" and each
-carries the evidence positions (launch site, conflicting access, closer,
-senders) to judge quickly. Scan views have an **export .md** button in the
+The detectors model real Go synchronization: WaitGroup/pool joins (any
+`.Wait()` paired with `Done`/`Give` on the same object), channel joins
+(receiving from a channel the goroutine sends on or closes), `sync/atomic`
+mediation, mutex regions, `sync.Once`, deferred closes, field-level and
+slice-element disjointness, pointer-value vs pointee accesses, and
+externally-owned channels (`ctx.Done()`, `time.Ticker.C`, library-returned
+or `signal.Notify`-registered). What remains is graded concrete vs
+theoretical; findings carry the evidence positions (launch site,
+conflicting access, closer, senders) to judge quickly. Scan views have an **export .md** button in the
 UI toolbar that downloads the report as structured markdown (categories as
 sections, numbered findings with positions, evidence as nested bullets). Scanning is fast enough for large codebases
 (~900-file repos in ~4s, ~2300-file repos in ~8s). `examples/buggy`

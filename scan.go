@@ -73,7 +73,7 @@ func (a *analyzer) scan(base string) *node {
 func countFindings(n *node) int {
 	c := 0
 	switch n.Kind {
-	case "race", "race-warn", "chan-closed", "chan-closed-warn", "fd-leak", "go-leak":
+	case "race", "race-warn", "chan-closed", "chan-closed-warn", "fd-leak", "fd-leak-warn", "go-leak", "go-leak-warn":
 		c++
 	}
 	for _, k := range n.Kids {
@@ -101,11 +101,15 @@ func (a *analyzer) fileFor(pos token.Pos) (*packages.Package, *ast.File) {
 }
 
 // enclosingFuncBody returns the innermost function body containing pos.
+// Deferred literals are transparent — they execute in the enclosing
+// function's flow.
 func enclosingFuncBody(f *ast.File, pos token.Pos) *ast.BlockStmt {
 	var body *ast.BlockStmt
+	var stack []ast.Node
 	ast.Inspect(f, func(n ast.Node) bool {
 		if n == nil {
-			return false
+			stack = stack[:len(stack)-1]
+			return true
 		}
 		if pos < n.Pos() || pos > n.End() {
 			return false
@@ -116,8 +120,11 @@ func enclosingFuncBody(f *ast.File, pos token.Pos) *ast.BlockStmt {
 				body = d.Body
 			}
 		case *ast.FuncLit:
-			body = d.Body
+			if !isDeferredLit(d, stack) {
+				body = d.Body
+			}
 		}
+		stack = append(stack, n)
 		return true
 	})
 	return body
@@ -139,11 +146,58 @@ type identAcc struct {
 	v     *types.Var
 	pos   token.Pos
 	write bool
+	// index is the first index expression applied to the variable
+	// (v[i], (*v)[i]); nil for direct accesses.
+	index ast.Expr
+	// slice reports the indexed container is a slice/array — distinct
+	// elements are distinct memory. False for maps (never sharding-safe).
+	slice bool
+	// lenCap: the access is only len(v)/cap(v) — header-only, safe beside
+	// element writes.
+	lenCap bool
+	// atomic: the access is &v passed to a sync/atomic function.
+	atomic bool
+	// addrOnly: the access is &v (address taken, not passed to atomics) —
+	// it reads/writes no memory of v itself.
+	addrOnly bool
+	// field is the first field selected on the variable (v.f…); nil for
+	// whole-variable accesses. Distinct fields are distinct memory.
+	field *types.Var
+	// deref: the access goes through the variable (v.f, *v, v[i]) rather
+	// than touching the variable's own storage. For pointer variables a
+	// plain read (return v, f(v)) copies the pointer and cannot race with
+	// writes through it.
+	deref bool
+	// methodRecv: the variable is used as a method-call receiver — what
+	// the method touches is not statically visible.
+	methodRecv bool
+}
+
+// fieldsCompat reports whether two accesses can touch the same memory:
+// whole-variable accesses overlap everything, field accesses only overlap
+// the same field, and — for pointer variables — a plain read of the
+// pointer value (return v, f(v)) overlaps nothing accessed through it.
+func fieldsCompat(a, b identAcc) bool {
+	if isPointerVar(a.v) {
+		if (!a.deref && !a.write && b.deref) || (!b.deref && !b.write && a.deref) {
+			return false // pointer-value copy vs access through the pointer
+		}
+	}
+	return a.field == nil || b.field == nil || a.field == b.field
+}
+
+func isPointerVar(v *types.Var) bool {
+	if v == nil {
+		return false
+	}
+	_, ok := v.Type().Underlying().(*types.Pointer)
+	return ok
 }
 
 // collectAccesses records every variable read/write under root, skipping
-// the given subtree.
-func collectAccesses(info *types.Info, root ast.Node, skipNode ast.Node) []identAcc {
+// the given subtree. With skipGo, nested `go` statements are excluded —
+// their accesses belong to their own goroutine (analyzed separately).
+func collectAccesses(info *types.Info, root ast.Node, skipNode ast.Node, skipGo bool) []identAcc {
 	var out []identAcc
 	var stack []ast.Node
 	ast.Inspect(root, func(n ast.Node) bool {
@@ -154,13 +208,21 @@ func collectAccesses(info *types.Info, root ast.Node, skipNode ast.Node) []ident
 		if n == skipNode {
 			return false
 		}
+		if skipGo {
+			if _, ok := n.(*ast.GoStmt); ok {
+				return false
+			}
+		}
 		if id, ok := n.(*ast.Ident); ok && id.Name != "_" {
 			obj := info.Uses[id]
 			if obj == nil {
 				obj = info.Defs[id]
 			}
 			if v, ok := obj.(*types.Var); ok {
-				out = append(out, identAcc{v: v, pos: id.Pos(), write: isWriteAccess(id, stack)})
+				acc := classifyAccess(info, id, stack)
+				acc.v = v
+				acc.pos = id.Pos()
+				out = append(out, acc)
 			}
 		}
 		stack = append(stack, n)
@@ -169,40 +231,107 @@ func collectAccesses(info *types.Info, root ast.Node, skipNode ast.Node) []ident
 	return out
 }
 
-// isWriteAccess reports whether the identifier is (part of) an assignment
-// target, incremented, ranged into, or has its address taken.
-func isWriteAccess(id *ast.Ident, stack []ast.Node) bool {
+// classifyAccess walks up from the identifier to determine how the
+// variable is accessed: read/write, through which index, via len/cap, or
+// mediated by a sync/atomic call.
+func classifyAccess(info *types.Info, id *ast.Ident, stack []ast.Node) identAcc {
+	var acc identAcc
 	var child ast.Node = id
 	for i := len(stack) - 1; i >= 0; i-- {
 		switch p := stack[i].(type) {
 		case *ast.SelectorExpr:
 			if p.X != child {
-				return false // id is the field name; the root ident decides
+				return acc // id is the field name; the root ident decides
+			}
+			acc.deref = true
+			if sel, ok := info.Selections[p]; ok {
+				if acc.field == nil && acc.index == nil && sel.Kind() == types.FieldVal {
+					if fv, ok := sel.Obj().(*types.Var); ok {
+						acc.field = fv
+					}
+				}
+				if sel.Kind() == types.MethodVal {
+					acc.methodRecv = true
+				}
 			}
 			child = p
 		case *ast.IndexExpr:
 			if p.X != child {
-				return false
+				return acc // id is inside the index expression — a read
+			}
+			acc.deref = true
+			if acc.index == nil {
+				acc.index = p.Index
+				acc.slice = isSliceOrArray(info.TypeOf(p.X))
 			}
 			child = p
 		case *ast.StarExpr:
+			acc.deref = true
 			child = p
 		case *ast.ParenExpr:
 			child = p
 		case *ast.UnaryExpr:
-			// address taken — anything could write through it
-			return p.Op == token.AND && p.X == child
+			if p.Op == token.AND && p.X == child {
+				// &v passed to a sync/atomic function is an atomic write;
+				// any other address-of touches no memory of v — counting it
+				// as an access produced false evidence for every
+				// `return &x` / `f(&x)`.
+				if i > 0 {
+					if call, ok := stack[i-1].(*ast.CallExpr); ok && isAtomicCall(info, call) {
+						acc.atomic = true
+						acc.write = true
+						return acc
+					}
+				}
+				acc.addrOnly = true
+				return acc
+			}
+			return acc
+		case *ast.CallExpr:
+			// variable used directly as an argument — len/cap are
+			// header-only reads
+			if bid, ok := ast.Unparen(p.Fun).(*ast.Ident); ok && (bid.Name == "len" || bid.Name == "cap") {
+				if _, isB := info.Uses[bid].(*types.Builtin); isB {
+					acc.lenCap = true
+				}
+			}
+			return acc
 		case *ast.AssignStmt:
-			return slices.ContainsFunc(p.Lhs, func(l ast.Expr) bool { return l == child })
+			acc.write = slices.ContainsFunc(p.Lhs, func(l ast.Expr) bool { return l == child })
+			return acc
 		case *ast.IncDecStmt:
-			return p.X == child
+			acc.write = p.X == child
+			return acc
 		case *ast.RangeStmt:
-			return p.Key == child || p.Value == child
+			if p.X == child && p.Value == nil {
+				// `for i := range v` reads only the header — safe beside
+				// element writes, like len()
+				acc.lenCap = true
+				return acc
+			}
+			acc.write = p.Key == child || p.Value == child
+			return acc
 		default:
-			return false
+			return acc
 		}
 	}
+	return acc
+}
+
+func isSliceOrArray(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	switch deref(t).Underlying().(type) {
+	case *types.Slice, *types.Array:
+		return true
+	}
 	return false
+}
+
+func isAtomicCall(info *types.Info, call *ast.CallExpr) bool {
+	fn, ok := typeutil.Callee(info, call).(*types.Func)
+	return ok && fn.Pkg() != nil && fn.Pkg().Path() == "sync/atomic"
 }
 
 // syncSafeType reports types that are safe (or expected) to share between
@@ -246,19 +375,91 @@ func (a *analyzer) findRaces() []finding {
 	for _, p := range a.pkgs {
 		for _, f := range p.Syntax {
 			ast.Inspect(f, func(n ast.Node) bool {
-				gs, ok := n.(*ast.GoStmt)
-				if !ok {
-					return true
+				switch x := n.(type) {
+				case *ast.GoStmt:
+					if lit, ok := ast.Unparen(x.Call.Fun).(*ast.FuncLit); ok {
+						out = append(out, a.racesInGoroutine(p, f, x, lit)...)
+					}
+				case *ast.RangeStmt:
+					out = append(out, a.loopVarAddrEscape(p, x)...)
 				}
-				lit, ok := ast.Unparen(gs.Call.Fun).(*ast.FuncLit)
-				if !ok {
-					return true
-				}
-				out = append(out, a.racesInGoroutine(p, f, gs, lit)...)
 				return true
 			})
 		}
 	}
+	return out
+}
+
+// addrEscapes reports whether an &v expression (top of stack minus the
+// UnaryExpr) flows into a call argument, a channel send, or a composite
+// literal — i.e. the pointer can be retained past the iteration. A bare
+// `&v` used locally (e.g. immediately dereferenced) does not escape.
+func addrEscapes(stack []ast.Node) bool {
+	for i := len(stack) - 1; i >= 0; i-- {
+		switch n := stack[i].(type) {
+		case *ast.ParenExpr, *ast.KeyValueExpr:
+			continue // transparent wrappers
+		case *ast.CompositeLit:
+			continue // struct/slice holding the pointer — keep climbing
+		case *ast.CallExpr:
+			return n.Fun != stackChild(stack, i) // &v is an argument, not the callee
+		case *ast.SendStmt:
+			return true
+		default:
+			return false // hit a statement or other expr — stays local
+		}
+	}
+	return false
+}
+
+func stackChild(stack []ast.Node, i int) ast.Node {
+	if i+1 < len(stack) {
+		return stack[i+1]
+	}
+	return nil
+}
+
+// loopVarAddrEscape flags `for v = range ch { … f(&v) … }`: v is declared
+// OUTSIDE the loop (Tok is =, not :=) so every iteration reuses the same
+// storage, and its address is handed to a callee — if the receiver holds
+// it (UI models, collectors, other goroutines), it observes later
+// iterations' overwrites.
+func (a *analyzer) loopVarAddrEscape(p *packages.Package, rs *ast.RangeStmt) []finding {
+	if rs.Tok != token.ASSIGN || !isChanType(p.TypesInfo.TypeOf(rs.X)) {
+		return nil
+	}
+	keyID, ok := ast.Unparen(rs.Key).(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	v, ok := p.TypesInfo.Uses[keyID].(*types.Var)
+	if !ok || syncSafeType(v.Type()) {
+		return nil
+	}
+	var out []finding
+	var stack []ast.Node
+	ast.Inspect(rs.Body, func(n ast.Node) bool {
+		if n == nil {
+			stack = stack[:len(stack)-1]
+			return true
+		}
+		if len(out) > 0 {
+			return false // one finding per loop
+		}
+		if u, ok := n.(*ast.UnaryExpr); ok && u.Op == token.AND {
+			if id, ok := ast.Unparen(u.X).(*ast.Ident); ok && p.TypesInfo.Uses[id] == types.Object(v) && addrEscapes(stack) {
+				spans := []span{{T: "address of loop-reused variable "},
+					{T: v.Name(), V: a.varID(v)},
+					{T: " escapes on every iteration — the receiver may observe later overwrites"}}
+				fn := nodeWithSpans(a.relPos(u.Pos()), "race-warn", "", spans)
+				fn.notep(a.relPos(rs.For), "loop reuses the variable (for %s = range …)", v.Name())
+				fn.note("declare the variable inside the loop (for %s := range …) or copy it before taking its address", v.Name())
+				out = append(out, finding{pos: u.Pos(), n: fn})
+			}
+		}
+		stack = append(stack, n)
+		return true
+	})
 	return out
 }
 
@@ -279,14 +480,18 @@ func (a *analyzer) racesInGoroutine(p *packages.Package, f *ast.File, gs *ast.Go
 		}
 		return s
 	}
-	for _, acc := range collectAccesses(p.TypesInfo, lit.Body, nil) {
-		// captured: declared outside the literal
-		if !acc.v.Pos().IsValid() || within(acc.v.Pos(), lit) || syncSafeType(acc.v.Type()) {
+	for _, acc := range collectAccesses(p.TypesInfo, lit.Body, nil, true) {
+		// captured: declared outside the literal; address-of touches
+		// nothing
+		if acc.addrOnly || !acc.v.Pos().IsValid() || within(acc.v.Pos(), lit) || syncSafeType(acc.v.Type()) {
 			continue
 		}
 		get(acc.v).in = append(get(acc.v).in, acc)
 	}
-	for _, acc := range collectAccesses(p.TypesInfo, encl, lit) {
+	for _, acc := range collectAccesses(p.TypesInfo, encl, lit, false) {
+		if acc.addrOnly {
+			continue
+		}
 		if s, tracked := byVar[acc.v]; tracked {
 			// Concurrent with the goroutine: anything after the launch — or
 			// inside the launching loop's body (later iterations run beside
@@ -304,14 +509,39 @@ func (a *analyzer) racesInGoroutine(p *packages.Package, f *ast.File, gs *ast.Go
 
 	gsArms := branchArms(encl, gs.Pos())
 	reachable := a.declReachable(p, f, gs.Pos())
-	doneWGs := a.wgDoneClasses(p, lit)
-	waits := a.wgWaitCalls(p, encl)
 
-	// An access after a wg.Wait() that joins this goroutine (the goroutine
-	// calls Done on the same WaitGroup) is synchronized, not racy.
+	// Join points after which parent accesses are synchronized: wg.Wait()
+	// for WaitGroups the goroutine calls Done on, and receives from
+	// channels the goroutine sends on or closes.
+	doneWGs := a.wgDoneClasses(p, lit)
+	signals := a.chanSignalClasses(p, lit)
+	joins := a.wgWaitCalls(p, encl)
+	for _, r := range a.chanRecvPoints(p, encl) {
+		if signals[r.key] {
+			joins = append(joins, r)
+		}
+	}
 	syncedAfterLaunch := func(accPos token.Pos) bool {
-		for _, w := range waits {
-			if w.pos > gs.End() && w.pos < accPos && doneWGs[w.key] {
+		for _, w := range joins {
+			if w.pos > gs.End() && w.pos < accPos && (doneWGs[w.key] || signals[w.key]) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Receives the goroutine blocks on before touching a variable gate its
+	// accesses on an external signal.
+	var litRecvs []token.Pos
+	walkSameFlow(lit.Body, func(n ast.Node) bool {
+		if u, ok := n.(*ast.UnaryExpr); ok && u.Op == token.ARROW {
+			litRecvs = append(litRecvs, u.OpPos)
+		}
+		return true
+	})
+	recvGated := func(pos token.Pos) bool {
+		for _, r := range litRecvs {
+			if r < pos {
 				return true
 			}
 		}
@@ -320,29 +550,52 @@ func (a *analyzer) racesInGoroutine(p *packages.Package, f *ast.File, gs *ast.Go
 
 	var out []finding
 	for v, s := range byVar {
-		wIn := firstWrite(s.in)
+		wIn := firstRealWrite(s.in)
 
-		// A goroutine launched in a loop that writes the variable races its
-		// own instances — concrete no matter what the parent does.
+		// A goroutine launched in a loop that writes the variable (not via
+		// sync/atomic) races its own instances — concrete no matter what
+		// the parent does.
 		multiInstance := wIn != nil && loop != nil && !within(v.Pos(), loop)
 
-		// conflicting outside accesses: any access when the goroutine
-		// writes, writes only when the goroutine just reads
-		var candidates []identAcc
-		if wIn != nil {
-			candidates = s.out
-		} else if len(s.in) > 0 {
-			for _, o := range s.out {
-				if o.write {
-					candidates = append(candidates, o)
+		// Conflicting outside accesses: pair-wise — same memory (field
+		// compatibility), at least one side writes, not both atomic,
+		// address-of touches nothing.
+		conflicting := func(out identAcc) bool {
+			if out.addrOnly {
+				return false
+			}
+			for _, in := range s.in {
+				if !fieldsCompat(in, out) {
+					continue
 				}
+				if !in.write && !out.write {
+					continue
+				}
+				if in.atomic && out.atomic {
+					continue
+				}
+				return true
+			}
+			return false
+		}
+		insideWritesIndexed := wIn != nil
+		for _, acc := range s.in {
+			if acc.write && acc.index == nil && !acc.atomic {
+				insideWritesIndexed = false
+				break
 			}
 		}
 		var live []identAcc
-		for _, c := range candidates {
-			if !syncedAfterLaunch(c.pos) {
-				live = append(live, c)
+		for _, c := range s.out {
+			if !conflicting(c) || syncedAfterLaunch(c.pos) {
+				continue
 			}
+			// header-only reads (len/cap/keyless range) don't conflict with
+			// element writes
+			if c.lenCap && insideWritesIndexed {
+				continue
+			}
+			live = append(live, c)
 		}
 		if !multiInstance && len(live) == 0 {
 			continue // no unsynchronized counterpart — not a race
@@ -380,17 +633,90 @@ func (a *analyzer) racesInGoroutine(p *packages.Package, f *ast.File, gs *ast.Go
 
 		// Grade: RACE only when the race is concrete in the current
 		// codebase — everything theoretical is RACE WARN with the reason.
-		kind := "race"
+		concrete := false
 		var reasons []string
-		if !multiInstance && !confirmed {
-			kind = "race-warn"
-			reasons = append(reasons,
-				"the branches guarding the launch and this access may be mutually exclusive — racy only if a code change lets them overlap")
+
+		if multiInstance {
+			switch {
+			case shardedAccesses(p.TypesInfo, s.in, lit, loop):
+				reasons = append(reasons,
+					"index-sharded fan-out: each goroutine instance accesses a distinct slice element — disjoint elements do not race")
+			case onceGuardedWrites(p, lit, s.in):
+				reasons = append(reasons,
+					"the goroutine's writes are inside sync.Once.Do — they execute at most once")
+			case len(a.mutexHeldAt(p, lit.Body, wIn.pos)) > 0:
+				reasons = append(reasons,
+					"the goroutine's writes appear serialized by a mutex (lock pairing not verified)")
+			default:
+				concrete = true
+			}
+		}
+		if !concrete && conflict != nil {
+			allGated := true
+			for _, in := range s.in {
+				if fieldsCompat(in, *conflict) && !recvGated(in.pos) {
+					allGated = false
+					break
+				}
+			}
+			// element-vs-element: both sides index the slice — overlap not
+			// provable either way
+			bothIndexed := conflict.index != nil && conflict.slice
+			if bothIndexed {
+				for _, in := range s.in {
+					if !fieldsCompat(in, *conflict) || (!in.write && !conflict.write) || in.addrOnly || in.lenCap || in.atomic {
+						continue
+					}
+					if in.index == nil || !in.slice {
+						bothIndexed = false
+						break
+					}
+				}
+			}
+			switch {
+			case !confirmed:
+				reasons = append(reasons,
+					"the branches guarding the launch and this access may be mutually exclusive — racy only if a code change lets them overlap")
+			case allGated:
+				reasons = append(reasons,
+					"the goroutine blocks on a channel receive before touching the variable — ordering depends on when that signal fires")
+			case bothIndexed:
+				reasons = append(reasons,
+					"both sides access slice elements at different indices — racy only if the index ranges overlap")
+			default:
+				// use each access's innermost function body — the
+				// conflicting access may live in a sibling goroutine
+				inPos := s.in[0].pos
+				if wIn != nil {
+					inPos = wIn.pos
+				}
+				inBody := enclosingFuncBody(f, inPos)
+				outBody := enclosingFuncBody(f, conflict.pos)
+				if inBody == nil {
+					inBody = lit.Body
+				}
+				if outBody == nil {
+					outBody = encl
+				}
+				inGuards := a.mutexHeldAt(p, inBody, inPos)
+				if intersects(inGuards, a.mutexHeldAt(p, outBody, conflict.pos)) {
+					reasons = append(reasons,
+						"both accesses appear guarded by the same mutex (lock pairing not verified)")
+				} else {
+					concrete = true
+				}
+			}
 		}
 		if !reachable {
-			kind = "race-warn"
+			concrete = false
 			reasons = append(reasons,
 				"the enclosing function has no callers in this codebase — the race needs new calling code to occur")
+		}
+		kind := "race"
+		if concrete {
+			reasons = nil // downgrade reasons don't apply to a concrete race
+		} else {
+			kind = "race-warn"
 		}
 
 		suffix := " — captured by goroutine without synchronization"
@@ -463,9 +789,10 @@ func armsSubset(a, b map[ast.Node]bool) bool {
 	return true
 }
 
-func firstWrite(accs []identAcc) *identAcc {
+// firstRealWrite returns the first non-atomic write.
+func firstRealWrite(accs []identAcc) *identAcc {
 	for i := range accs {
-		if accs[i].write {
+		if accs[i].write && !accs[i].atomic {
 			return &accs[i]
 		}
 	}
@@ -513,6 +840,7 @@ func enclosingLoop(root ast.Node, target ast.Node) ast.Node {
 // referenced (called or used as a value) from a reachable function.
 func (a *analyzer) buildReachability() {
 	edges := map[*types.Func][]*types.Func{}
+	a.callersOf = map[*types.Func]map[*types.Func]bool{}
 	var roots []*types.Func
 
 	for fn, def := range a.funcs {
@@ -529,6 +857,10 @@ func (a *analyzer) buildReachability() {
 				if callee, ok := info.Uses[id].(*types.Func); ok {
 					if _, local := a.funcs[callee.Origin()]; local {
 						edges[fn] = append(edges[fn], callee.Origin())
+						if a.callersOf[callee.Origin()] == nil {
+							a.callersOf[callee.Origin()] = map[*types.Func]bool{}
+						}
+						a.callersOf[callee.Origin()][fn] = true
 					}
 				}
 			}
@@ -612,8 +944,10 @@ func isWaitGroupType(t types.Type) bool {
 	return pkg != nil && pkg.Path() == "sync" && named.Obj().Name() == "WaitGroup"
 }
 
-// wgDoneClasses returns the alias classes of WaitGroups this goroutine
-// calls Done on (including in defers and nested literals).
+// wgDoneClasses returns the alias classes of join objects this goroutine
+// signals completion on: X.Done() or X.Give() on any type (sync.WaitGroup,
+// errgroup-style groups, worker pools), including in defers and nested
+// literals.
 func (a *analyzer) wgDoneClasses(p *packages.Package, lit *ast.FuncLit) map[any]bool {
 	out := map[any]bool{}
 	ast.Inspect(lit.Body, func(n ast.Node) bool {
@@ -622,7 +956,7 @@ func (a *analyzer) wgDoneClasses(p *packages.Package, lit *ast.FuncLit) map[any]
 			return true
 		}
 		sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != "Done" || !isWaitGroupType(p.TypesInfo.TypeOf(sel.X)) {
+		if !ok || (sel.Sel.Name != "Done" && sel.Sel.Name != "Give") {
 			return true
 		}
 		if k := varRootObj(p.TypesInfo, sel.X); k != nil {
@@ -638,9 +972,10 @@ type wgWait struct {
 	pos token.Pos
 }
 
-// wgWaitCalls collects non-deferred WaitGroup.Wait() calls in the same flow
-// as body (deferred Waits run at function exit and don't order in-body
-// accesses).
+// wgWaitCalls collects non-deferred X.Wait() calls on any receiver type in
+// the same flow as body (deferred Waits run at function exit and don't
+// order in-body accesses). Wait/Done|Give pairing is matched by alias
+// class, so worker pools and errgroup-style types join like WaitGroups.
 func (a *analyzer) wgWaitCalls(p *packages.Package, body *ast.BlockStmt) []wgWait {
 	var out []wgWait
 	ast.Inspect(body, func(n ast.Node) bool {
@@ -652,11 +987,376 @@ func (a *analyzer) wgWaitCalls(p *packages.Package, body *ast.BlockStmt) []wgWai
 				return true
 			}
 			sel, ok := ast.Unparen(x.Fun).(*ast.SelectorExpr)
-			if !ok || sel.Sel.Name != "Wait" || !isWaitGroupType(p.TypesInfo.TypeOf(sel.X)) {
+			if !ok || sel.Sel.Name != "Wait" {
 				return true
 			}
 			if k := varRootObj(p.TypesInfo, sel.X); k != nil {
 				out = append(out, wgWait{key: a.find(k), pos: x.Pos()})
+			}
+		}
+		return true
+	})
+	return out
+}
+
+// chanEscapes reports whether a channel's identity extends beyond what the
+// analysis can see: rooted in (or aliased to) a function parameter or
+// struct field, or returned from a local function — callers own the other
+// end.
+func (a *analyzer) chanEscapes(key any) bool {
+	if a.escapingChanObj(key) {
+		return true
+	}
+	if a.escapeRoots == nil {
+		a.escapeRoots = map[any]bool{}
+		mark := func(k any) {
+			if a.escapingChanObj(k) {
+				a.escapeRoots[a.find(k)] = true
+			}
+			switch o := k.(type) {
+			case resultKey:
+				// returned from a local function (callers own the other
+				// end) or produced by a non-local call (library-owned)
+				a.escapeRoots[a.find(k)] = true
+			case types.Object:
+				if pkg := o.Pkg(); pkg != nil && a.classify(pkg) != "local" {
+					a.escapeRoots[a.find(k)] = true
+				}
+			}
+		}
+		// both sides of the union-find: values may be keys never seen on
+		// the left (e.g. resultKeys unioned as roots)
+		for k, v := range a.aliasParent {
+			mark(k)
+			mark(v)
+		}
+		for _, ek := range a.extChanKeys {
+			a.escapeRoots[a.find(ek)] = true
+		}
+		for _, ek := range a.escapedChanKeys {
+			a.escapeRoots[a.find(ek)] = true
+		}
+	}
+	return a.escapeRoots[a.find(key)]
+}
+
+// escapingChanObj reports a channel-typed variable that is a struct field
+// or a function parameter.
+func (a *analyzer) escapingChanObj(key any) bool {
+	v, ok := key.(*types.Var)
+	if !ok || !isChanType(v.Type()) {
+		return false
+	}
+	if v.IsField() {
+		return true
+	}
+	if site, ok := a.defs[v]; ok {
+		if _, isParam := site.node.(*ast.Field); isParam {
+			return true
+		}
+	}
+	return false
+}
+
+// chanBuffered reports whether the channel was created with a nonzero
+// capacity.
+func (a *analyzer) chanBuffered(key any) bool {
+	v, ok := key.(types.Object)
+	if !ok {
+		return false
+	}
+	site, found := a.defs[v]
+	if !found {
+		return false
+	}
+	buffered := false
+	ast.Inspect(site.node, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) != 2 {
+			return true
+		}
+		if id, ok := ast.Unparen(call.Fun).(*ast.Ident); ok && id.Name == "make" {
+			if lit, isLit := ast.Unparen(call.Args[1]).(*ast.BasicLit); !isLit || lit.Value != "0" {
+				buffered = true
+			}
+		}
+		return true
+	})
+	return buffered
+}
+
+// externalChanKey reports channels whose other end lives outside the
+// module: produced by a non-local call (ctx.Done(), time.After, library
+// streams), stored in a non-local type's field (time.Ticker.C), or handed
+// to non-local code (signal.Notify).
+func (a *analyzer) externalChanKey(key any) bool {
+	switch k := key.(type) {
+	case resultKey:
+		if _, local := a.funcs[k.fn]; !local {
+			return true
+		}
+	case types.Object:
+		if pkg := k.Pkg(); pkg != nil && a.classify(pkg) != "local" {
+			return true
+		}
+	}
+	root := a.find(key)
+	for _, ek := range a.extChanKeys {
+		if a.find(ek) == root {
+			return true
+		}
+	}
+	return false
+}
+
+// ---------- theoretical-race guards ----------
+
+// indexPerInstance reports whether the index expression involves a
+// variable private to this goroutine instance: declared inside the literal
+// (a parameter or local) or inside the launching loop (per-iteration in
+// Go ≥1.22).
+func indexPerInstance(info *types.Info, index ast.Expr, lit *ast.FuncLit, loop ast.Node) bool {
+	per := false
+	ast.Inspect(index, func(n ast.Node) bool {
+		id, ok := n.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		obj := info.Uses[id]
+		if obj == nil {
+			obj = info.Defs[id]
+		}
+		if v, ok := obj.(*types.Var); ok && v.Pos().IsValid() {
+			if within(v.Pos(), lit) || (loop != nil && within(v.Pos(), loop)) {
+				per = true
+			}
+		}
+		return true
+	})
+	return per
+}
+
+// shardedAccesses reports whether the goroutine's writes to the variable
+// are slice/array element writes at per-instance indices — the
+// fan-out-by-index pattern where distinct instances touch distinct memory.
+// Reads must not overlap the written region either: element reads at
+// per-instance indices, len/cap, and reads of other (unwritten) fields are
+// fine.
+func shardedAccesses(info *types.Info, accs []identAcc, lit *ast.FuncLit, loop ast.Node) bool {
+	writtenFields := map[*types.Var]bool{}
+	wholeFieldWritten := false
+	sawWrite := false
+	for _, acc := range accs {
+		if !acc.write || acc.atomic {
+			continue
+		}
+		if acc.index == nil || !acc.slice || !indexPerInstance(info, acc.index, lit, loop) {
+			return false // non-sharded write (incl. maps — never safe)
+		}
+		sawWrite = true
+		if acc.field == nil {
+			wholeFieldWritten = true
+		} else {
+			writtenFields[acc.field] = true
+		}
+	}
+	if !sawWrite {
+		return false
+	}
+	for _, acc := range accs {
+		if acc.write || acc.atomic || acc.lenCap || acc.addrOnly || acc.methodRecv {
+			continue
+		}
+		// reads of fields nobody writes can't overlap the sharded writes
+		if acc.field != nil && !wholeFieldWritten && !writtenFields[acc.field] {
+			continue
+		}
+		if acc.index == nil || !acc.slice || !indexPerInstance(info, acc.index, lit, loop) {
+			return false
+		}
+	}
+	return true
+}
+
+func isMutexType(t types.Type) bool {
+	named, ok := types.Unalias(deref(t)).(*types.Named)
+	if !ok {
+		return false
+	}
+	pkg := named.Obj().Pkg()
+	if pkg == nil || pkg.Path() != "sync" {
+		return false
+	}
+	name := named.Obj().Name()
+	return name == "Mutex" || name == "RWMutex"
+}
+
+// mutexHeldAt approximates the set of mutex alias classes held at pos
+// within body: a (R)Lock call earlier in the same flow, released by a
+// deferred (R)Unlock or an (R)Unlock after pos.
+func (a *analyzer) mutexHeldAt(p *packages.Package, body *ast.BlockStmt, pos token.Pos) map[any]bool {
+	type mcall struct {
+		key      any
+		pos      token.Pos
+		lock     bool
+		deferred bool
+	}
+	var calls []mcall
+	var stack []ast.Node
+	ast.Inspect(body, func(n ast.Node) bool {
+		if n == nil {
+			stack = stack[:len(stack)-1]
+			return true
+		}
+		switch x := n.(type) {
+		case *ast.GoStmt:
+			return false
+		case *ast.FuncLit:
+			// deferred literals run in this goroutine at exit — their
+			// locks guard their accesses; other literals are foreign flow
+			if !isDeferredLit(x, stack) {
+				return false
+			}
+		}
+		if call, ok := n.(*ast.CallExpr); ok && len(call.Args) == 0 {
+			if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok && isMutexType(p.TypesInfo.TypeOf(sel.X)) {
+				name := sel.Sel.Name
+				if name == "Lock" || name == "RLock" || name == "Unlock" || name == "RUnlock" {
+					if k := varRootObj(p.TypesInfo, sel.X); k != nil {
+						// deferred means the CALL itself is deferred
+						// (defer mu.Unlock()); calls inside a deferred
+						// literal's body execute as normal statements when
+						// the literal runs
+						deferred := false
+						for i := len(stack) - 1; i >= 0; i-- {
+							if _, ok := stack[i].(*ast.FuncLit); ok {
+								break
+							}
+							if _, ok := stack[i].(*ast.DeferStmt); ok {
+								deferred = true
+								break
+							}
+						}
+						calls = append(calls, mcall{
+							key:      a.find(k),
+							pos:      call.Pos(),
+							lock:     name == "Lock" || name == "RLock",
+							deferred: deferred,
+						})
+					}
+				}
+			}
+		}
+		stack = append(stack, n)
+		return true
+	})
+	held := map[any]bool{}
+	for _, lk := range calls {
+		if !lk.lock || lk.deferred || lk.pos > pos {
+			continue
+		}
+		for _, ul := range calls {
+			if !ul.lock && ul.key == lk.key && (ul.deferred || ul.pos > pos) {
+				held[lk.key] = true
+				break
+			}
+		}
+	}
+	return held
+}
+
+func intersects(a, b map[any]bool) bool {
+	for k := range a {
+		if b[k] {
+			return true
+		}
+	}
+	return false
+}
+
+// onceGuardedWrites reports whether every write the goroutine makes to the
+// variable happens inside a sync.Once.Do function literal.
+func onceGuardedWrites(p *packages.Package, lit *ast.FuncLit, accs []identAcc) bool {
+	var regions [][2]token.Pos
+	ast.Inspect(lit.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) != 1 {
+			return true
+		}
+		sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "Do" {
+			return true
+		}
+		if named, ok := types.Unalias(deref(p.TypesInfo.TypeOf(sel.X))).(*types.Named); ok {
+			if pkg := named.Obj().Pkg(); pkg != nil && pkg.Path() == "sync" && named.Obj().Name() == "Once" {
+				if fl, ok := ast.Unparen(call.Args[0]).(*ast.FuncLit); ok {
+					regions = append(regions, [2]token.Pos{fl.Pos(), fl.End()})
+				}
+			}
+		}
+		return true
+	})
+	sawWrite := false
+	for _, acc := range accs {
+		if !acc.write {
+			continue
+		}
+		sawWrite = true
+		inRegion := false
+		for _, r := range regions {
+			if acc.pos >= r[0] && acc.pos <= r[1] {
+				inRegion = true
+				break
+			}
+		}
+		if !inRegion {
+			return false
+		}
+	}
+	return sawWrite
+}
+
+// chanSignalClasses returns the alias classes of channels this goroutine
+// sends on or closes — receiving from them joins the goroutine's writes.
+func (a *analyzer) chanSignalClasses(p *packages.Package, lit *ast.FuncLit) map[any]bool {
+	out := map[any]bool{}
+	add := func(e ast.Expr) {
+		if k := a.chanKey(p.TypesInfo, e); k != nil {
+			out[a.find(k)] = true
+		}
+	}
+	ast.Inspect(lit.Body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.SendStmt:
+			add(x.Chan)
+		case *ast.CallExpr:
+			if id, ok := ast.Unparen(x.Fun).(*ast.Ident); ok && id.Name == "close" && len(x.Args) == 1 {
+				if _, isB := p.TypesInfo.Uses[id].(*types.Builtin); isB {
+					add(x.Args[0])
+				}
+			}
+		}
+		return true
+	})
+	return out
+}
+
+// chanRecvPoints collects channel receives in the same flow as body.
+func (a *analyzer) chanRecvPoints(p *packages.Package, body *ast.BlockStmt) []wgWait {
+	var out []wgWait
+	walkSameFlow(body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.UnaryExpr:
+			if x.Op == token.ARROW {
+				if k := a.chanKey(p.TypesInfo, x.X); k != nil {
+					out = append(out, wgWait{key: a.find(k), pos: x.OpPos})
+				}
+			}
+		case *ast.RangeStmt:
+			if isChanType(p.TypesInfo.TypeOf(x.X)) {
+				if k := a.chanKey(p.TypesInfo, x.X); k != nil {
+					out = append(out, wgWait{key: a.find(k), pos: x.For})
+				}
 			}
 		}
 		return true
@@ -691,17 +1391,38 @@ func (a *analyzer) sendsAfterCloseInFlow() []finding {
 					ch  ast.Expr
 				}
 				var closes, sends []opRec
-				walkSameFlow(fd.Body, func(n ast.Node) bool {
+				var stack []ast.Node
+				ast.Inspect(fd.Body, func(n ast.Node) bool {
+					if n == nil {
+						stack = stack[:len(stack)-1]
+						return true
+					}
+					switch n.(type) {
+					case *ast.FuncLit, *ast.GoStmt:
+						return false
+					}
 					switch x := n.(type) {
 					case *ast.SendStmt:
 						sends = append(sends, opRec{a.chanKey(info, x.Chan), x.Arrow, x.Chan})
 					case *ast.CallExpr:
 						if id, ok := ast.Unparen(x.Fun).(*ast.Ident); ok && id.Name == "close" && len(x.Args) == 1 {
 							if _, isB := info.Uses[id].(*types.Builtin); isB {
-								closes = append(closes, opRec{a.chanKey(info, x.Args[0]), x.Pos(), x.Args[0]})
+								// `defer close(ch)` runs at function exit —
+								// after every send in the body, regardless
+								// of source position
+								deferred := false
+								for _, s := range stack {
+									if _, ok := s.(*ast.DeferStmt); ok {
+										deferred = true
+									}
+								}
+								if !deferred {
+									closes = append(closes, opRec{a.chanKey(info, x.Args[0]), x.Pos(), x.Args[0]})
+								}
 							}
 						}
 					}
+					stack = append(stack, n)
 					return true
 				})
 				for _, s := range sends {
@@ -796,9 +1517,10 @@ func (a *analyzer) multiSenderCloses() []finding {
 		}
 		c := closes[0]
 
-		// Concrete only if both ends can actually run: the closing function
-		// and at least one rogue sender's function are reachable from the
-		// module's entry points.
+		// Concrete only if both ends can actually run concurrently: the
+		// closing function and at least one rogue sender's function are
+		// reachable, the senders aren't merely synchronous callees of the
+		// closing function, and the sends aren't recover-guarded.
 		kind := "chan-closed"
 		var reasons []string
 		closerReachable := a.posReachable(c.pos)
@@ -816,6 +1538,32 @@ func (a *analyzer) multiSenderCloses() []finding {
 		if !senderReachable {
 			kind = "chan-closed-warn"
 			reasons = append(reasons, "none of the sending functions have callers in this codebase")
+		}
+		if kind == "chan-closed" {
+			closerFn := a.declFnAt(c.pos)
+			allSequential := closerFn != nil
+			allRecovered := true
+			for _, s := range rogue {
+				// A sender inside a GO-LAUNCHED literal is concurrent with
+				// the closer by construction. Senders in other literals
+				// (closures invoked synchronously, walk callbacks) run in
+				// their declaration's flow — the sequential rule applies.
+				if a.opInGoLit(s) || !a.onlyReachedFrom(a.declFnAt(s.pos), closerFn, map[*types.Func]bool{}) {
+					allSequential = false
+				}
+				if !a.recoverGuarded(s.pos) {
+					allRecovered = false
+				}
+			}
+			if allSequential {
+				kind = "chan-closed-warn"
+				reasons = append(reasons,
+					"every sender is invoked only from the closing function's own call tree — likely sequential with the close, not concurrent")
+			} else if allRecovered {
+				kind = "chan-closed-warn"
+				reasons = append(reasons,
+					"the sends are recover()-guarded — a send on the closed channel is a handled path")
+			}
 		}
 
 		text := fmt.Sprintf("channel closed in %s while %d sender(s) elsewhere may still write to it", c.fn, len(rogue))
@@ -848,8 +1596,116 @@ func (a *analyzer) posReachable(pos token.Pos) bool {
 	return a.declReachable(p, f, pos)
 }
 
-// waitGroupWaitBefore reports whether the function enclosing pos calls
-// (*sync.WaitGroup).Wait before pos — the usual close coordination.
+// opInGoLit reports whether a channel op's innermost enclosing function is
+// a literal that is launched as a goroutine (go func(){…}()) — such ops
+// run concurrently with their declaration's flow. Literals invoked
+// synchronously (callbacks, closures) do not count.
+func (a *analyzer) opInGoLit(op chanOp) bool {
+	_, f := a.fileFor(op.pos)
+	if f == nil {
+		return false
+	}
+	fd := enclosingFuncDecl(f, op.pos)
+	if fd != nil && fd.Pos() == op.fnPos {
+		return false // op attributed to the named declaration
+	}
+	launched := false
+	var stack []ast.Node
+	ast.Inspect(f, func(n ast.Node) bool {
+		if n == nil {
+			stack = stack[:len(stack)-1]
+			return true
+		}
+		if op.fnPos < n.Pos() || op.fnPos > n.End() {
+			return false
+		}
+		if lit, ok := n.(*ast.FuncLit); ok && lit.Pos() == op.fnPos && len(stack) >= 2 {
+			if call, ok := stack[len(stack)-1].(*ast.CallExpr); ok && ast.Unparen(call.Fun) == ast.Expr(lit) {
+				if _, ok := stack[len(stack)-2].(*ast.GoStmt); ok {
+					launched = true
+				}
+			}
+		}
+		stack = append(stack, n)
+		return true
+	})
+	return launched
+}
+
+// declFnAt returns the named function whose declaration contains pos.
+func (a *analyzer) declFnAt(pos token.Pos) *types.Func {
+	p, f := a.fileFor(pos)
+	if f == nil {
+		return nil
+	}
+	fd := enclosingFuncDecl(f, pos)
+	if fd == nil {
+		return nil
+	}
+	if fn, ok := p.TypesInfo.Defs[fd.Name].(*types.Func); ok {
+		return fn.Origin()
+	}
+	return nil
+}
+
+// onlyReachedFrom reports whether fn is invoked exclusively from root's
+// call tree — i.e. every chain of callers of fn ends at root. Such a
+// "sender" runs synchronously within the closer's flow.
+func (a *analyzer) onlyReachedFrom(fn, root *types.Func, seen map[*types.Func]bool) bool {
+	if fn == nil || root == nil {
+		return false
+	}
+	if fn == root {
+		return true
+	}
+	if a.reachableFns == nil {
+		a.buildReachability()
+	}
+	callers := a.callersOf[fn]
+	if len(callers) == 0 {
+		return false
+	}
+	seen[fn] = true
+	for c := range callers {
+		if seen[c] {
+			continue // recursion — don't recurse forever
+		}
+		if !a.onlyReachedFrom(c, root, seen) {
+			return false
+		}
+	}
+	return true
+}
+
+// recoverGuarded reports whether the function enclosing pos contains a
+// recover() call — panics (like send on closed channel) are handled.
+func (a *analyzer) recoverGuarded(pos token.Pos) bool {
+	p, f := a.fileFor(pos)
+	if f == nil {
+		return false
+	}
+	body := enclosingFuncBody(f, pos)
+	if body == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			if id, ok := ast.Unparen(call.Fun).(*ast.Ident); ok && id.Name == "recover" {
+				if _, isB := p.TypesInfo.Uses[id].(*types.Builtin); isB {
+					found = true
+				}
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// waitGroupWaitBefore reports whether the function enclosing pos calls a
+// zero-arg X.Wait() before pos (sync.WaitGroup, errgroup, worker pools) —
+// directly, or through one level of local helper (p.stopAndWait()) — the
+// usual close coordination.
 func (a *analyzer) waitGroupWaitBefore(pos token.Pos) bool {
 	p, f := a.fileFor(pos)
 	if f == nil {
@@ -865,15 +1721,44 @@ func (a *analyzer) waitGroupWaitBefore(pos token.Pos) bool {
 		if !ok || call.Pos() > pos {
 			return true
 		}
-		sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != "Wait" {
-			return true
+		if len(call.Args) == 0 {
+			if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok && sel.Sel.Name == "Wait" {
+				found = true
+				return true
+			}
 		}
-		if isWaitGroupType(p.TypesInfo.TypeOf(sel.X)) {
+		if fn, ok := typeutil.Callee(p.TypesInfo, call).(*types.Func); ok && a.fnContainsWait(fn.Origin()) {
 			found = true
 		}
 		return true
 	})
+	return found
+}
+
+// fnContainsWait reports whether a local function's own flow calls a
+// zero-arg .Wait(); memoized.
+func (a *analyzer) fnContainsWait(fn *types.Func) bool {
+	if a.waitInside == nil {
+		a.waitInside = map[*types.Func]bool{}
+	}
+	if v, ok := a.waitInside[fn]; ok {
+		return v
+	}
+	a.waitInside[fn] = false // cycle guard
+	def, ok := a.funcs[fn]
+	if !ok || def.decl.Body == nil {
+		return false
+	}
+	found := false
+	walkSameFlow(def.decl.Body, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok && len(call.Args) == 0 {
+			if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok && sel.Sel.Name == "Wait" {
+				found = true
+			}
+		}
+		return !found
+	})
+	a.waitInside[fn] = found
 	return found
 }
 
@@ -927,7 +1812,14 @@ func (a *analyzer) findUnclosedFiles() []finding {
 					return true
 				}
 				v := varRootObj(info, id)
-				if v == nil || closed[a.find(v)] || a.escapesViaReturn(f, as.Pos(), v) {
+				if v == nil || a.escapesViaReturn(f, as.Pos(), v) {
+					return true
+				}
+				if closed[a.find(v)] {
+					// a Close exists — but do all paths reach it?
+					if warn := a.fdEarlyReturnWarn(p, f, as, call, v, id); warn != nil {
+						out = append(out, *warn)
+					}
 					return true
 				}
 				spans := append([]span{{T: "file handle "}, {T: id.Name, V: a.varID(v)},
@@ -940,6 +1832,108 @@ func (a *analyzer) findUnclosedFiles() []finding {
 		}
 	}
 	return out
+}
+
+// fdEarlyReturnWarn flags opens whose Close IS reached on the main path
+// but skipped by early returns between the open and the Close (or its
+// defer registration). The error-guard immediately after the open is
+// exempt — on that path the handle was never valid.
+func (a *analyzer) fdEarlyReturnWarn(p *packages.Package, f *ast.File, as *ast.AssignStmt, call *ast.CallExpr, v types.Object, id *ast.Ident) *finding {
+	body := enclosingFuncBody(f, as.Pos())
+	if body == nil {
+		return nil
+	}
+	root := a.find(v)
+
+	// earliest Close (or defer registration) on v's class in this function
+	var closePos token.Pos
+	var stack []ast.Node
+	ast.Inspect(body, func(n ast.Node) bool {
+		if n == nil {
+			stack = stack[:len(stack)-1]
+			return true
+		}
+		if c, ok := n.(*ast.CallExpr); ok && len(c.Args) == 0 {
+			if sel, ok := ast.Unparen(c.Fun).(*ast.SelectorExpr); ok && sel.Sel.Name == "Close" {
+				if k := varRootObj(p.TypesInfo, sel.X); k != nil && a.find(k) == root {
+					pos := c.Pos()
+					for i := len(stack) - 1; i >= 0; i-- {
+						if _, ok := stack[i].(*ast.FuncLit); ok {
+							break
+						}
+						if d, ok := stack[i].(*ast.DeferStmt); ok {
+							pos = d.Pos() // registration point
+							break
+						}
+					}
+					if !closePos.IsValid() || pos < closePos {
+						closePos = pos
+					}
+				}
+			}
+		}
+		stack = append(stack, n)
+		return true
+	})
+	if !closePos.IsValid() || closePos < as.End() {
+		return nil // closed elsewhere / before — nothing to path-check here
+	}
+
+	guard := stmtAfter(body, as) // the `if err != nil { return … }` idiom
+	var returns []token.Pos
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch n.(type) {
+		case *ast.FuncLit, *ast.GoStmt:
+			return false
+		}
+		if ret, ok := n.(*ast.ReturnStmt); ok {
+			if ret.Pos() > as.End() && ret.Pos() < closePos {
+				if guard == nil || !within(ret.Pos(), guard) {
+					returns = append(returns, ret.Pos())
+				}
+			}
+		}
+		return true
+	})
+	if len(returns) == 0 {
+		return nil
+	}
+
+	spans := append([]span{{T: "file handle "}, {T: id.Name, V: a.varID(v)},
+		{T: " ← "}}, truncateSpans(a.exprSpans(p, call), 45)...)
+	spans = append(spans, span{T: fmt.Sprintf(" is closed, but %d early-return path(s) skip the close", len(returns))})
+	n := nodeWithSpans(a.relPos(as.Pos()), "fd-leak-warn", "", spans)
+	n.notep(a.relPos(closePos), "closed here (registered on the main path only)")
+	for i, r := range returns {
+		if i == 4 {
+			n.note("… and %d more early returns", len(returns)-4)
+			break
+		}
+		n.notep(a.relPos(r), "returns without closing")
+	}
+	return &finding{pos: as.Pos(), n: n}
+}
+
+// stmtAfter returns the statement immediately following target in its
+// enclosing block, if it is an if-statement (the open's error guard).
+func stmtAfter(body *ast.BlockStmt, target ast.Stmt) ast.Stmt {
+	var next ast.Stmt
+	ast.Inspect(body, func(n ast.Node) bool {
+		blk, ok := n.(*ast.BlockStmt)
+		if !ok {
+			return true
+		}
+		for i, s := range blk.List {
+			if s == target && i+1 < len(blk.List) {
+				if ifs, ok := blk.List[i+1].(*ast.IfStmt); ok {
+					next = ifs
+				}
+				return false
+			}
+		}
+		return true
+	})
+	return next
 }
 
 func returnsOSFile(info *types.Info, call *ast.CallExpr) bool {
@@ -1054,13 +2048,45 @@ func (a *analyzer) leaksInBody(p *packages.Package, gs *ast.GoStmt, body *ast.Bl
 		if key == nil {
 			return
 		}
+		if a.externalChanKey(key) {
+			// the other end lives outside the module (ctx.Done, time.After,
+			// ticker.C, library-returned or signal.Notify-registered
+			// channels) — library-owned behavior, not a leak signal
+			return
+		}
 		if len(a.chanPeers(key, kind, pos)) > 0 {
 			return
 		}
+
+		// Grade: concrete LEAK only for a purely local channel with no
+		// counterpart anywhere; unverifiable cases are warnings with the
+		// reason.
+		leakKind := "go-leak"
+		var reasons []string
+		if _, ok := ast.Unparen(ch).(*ast.StarExpr); ok {
+			leakKind = "go-leak-warn"
+			reasons = append(reasons, "the channel sits behind a pointer — its identity (and counterpart) can't be verified")
+		}
+		if a.chanEscapes(key) {
+			leakKind = "go-leak-warn"
+			reasons = append(reasons, "the channel escapes this function (parameter, struct field or return value) — the counterpart may live in code the analysis can't link")
+		}
+		if kind == chanSend && a.chanBuffered(key) {
+			leakKind = "go-leak-warn"
+			reasons = append(reasons, "the channel is buffered — the send only blocks once the buffer is full")
+		}
+		if leakKind == "go-leak" && !a.posReachable(gs.Pos()) {
+			leakKind = "go-leak-warn"
+			reasons = append(reasons, "the enclosing function has no callers in this codebase")
+		}
+
 		spans := append([]span{{T: "goroutine may block forever: "}}, truncateSpans(a.exprSpans(p, ch), 40)...)
 		spans = append(spans, span{T: " has no " + what + " in the module"})
-		n := nodeWithSpans(a.relPos(pos), "go-leak", "", spans)
+		n := nodeWithSpans(a.relPos(pos), leakKind, "", spans)
 		n.notep(a.relPos(gs.Pos()), "goroutine launched here")
+		for _, r := range reasons {
+			n.note("%s", r)
+		}
 		out = append(out, finding{pos: pos, n: n})
 	}
 
@@ -1080,7 +2106,9 @@ func (a *analyzer) leaksInBody(p *packages.Package, gs *ast.GoStmt, body *ast.Bl
 		return true
 	})
 
-	// infinite loops with no way out
+	// infinite loops with no way out — only pure spins: any function call
+	// inside (time.Sleep, blocking I/O, work) means the loop makes
+	// progress or blocks legitimately, the pattern of long-lived daemons
 	walkSameFlow(body, func(n ast.Node) bool {
 		loop, ok := n.(*ast.ForStmt)
 		if !ok || loop.Cond != nil {
@@ -1089,7 +2117,7 @@ func (a *analyzer) leaksInBody(p *packages.Package, gs *ast.GoStmt, body *ast.Bl
 		hasExit := false
 		walkSameFlow(loop.Body, func(inner ast.Node) bool {
 			switch y := inner.(type) {
-			case *ast.ReturnStmt, *ast.SelectStmt, *ast.RangeStmt:
+			case *ast.ReturnStmt, *ast.SelectStmt, *ast.RangeStmt, *ast.CallExpr:
 				hasExit = true
 			case *ast.BranchStmt:
 				if y.Tok == token.BREAK || y.Tok == token.GOTO {

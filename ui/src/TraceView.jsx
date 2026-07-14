@@ -23,7 +23,9 @@ const BADGES = {
   'chan-closed': { text: 'closed ch', cls: 'b-close' },
   'chan-closed-warn': { text: 'closed ch warn', cls: 'b-warn' },
   'fd-leak': { text: 'fd leak', cls: 'b-fd' },
+  'fd-leak-warn': { text: 'fd leak warn', cls: 'b-warn' },
   'go-leak': { text: 'leak', cls: 'b-leak' },
+  'go-leak-warn': { text: 'leak warn', cls: 'b-warn' },
   peer: { text: 'peer', cls: 'b-peer' },
   note: { text: 'ℹ', cls: 'b-note' },
 }

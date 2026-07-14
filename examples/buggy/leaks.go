@@ -1,6 +1,10 @@
 package buggy
 
-import "context"
+import (
+	"context"
+
+	"example.com/extlib"
+)
 
 // LeakBlockedSend launches a goroutine that sends on a channel nobody ever
 // reads — it blocks forever.
@@ -29,6 +33,21 @@ func LeakBusyLoop(counters []int) {
 		}
 	}()
 	_ = counters
+}
+
+// LibraryStreamOK ranges over a channel produced by an external module —
+// the library owns the writer/close, must NOT be flagged.
+func LibraryStreamOK() int {
+	total := 0
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for v := range extlib.Stream(8) {
+			total += v
+		}
+	}()
+	<-done
+	return total
 }
 
 // WorkerOK drains its input and honors cancellation — must NOT be flagged.

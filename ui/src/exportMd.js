@@ -14,7 +14,9 @@ const KIND_LABELS = {
   'chan-closed': 'CLOSED CHANNEL',
   'chan-closed-warn': 'CLOSED CHANNEL WARN',
   'fd-leak': 'FD LEAK',
+  'fd-leak-warn': 'FD LEAK WARN',
   'go-leak': 'LEAK',
+  'go-leak-warn': 'LEAK WARN',
 }
 
 function evidence(lines, n, depth) {

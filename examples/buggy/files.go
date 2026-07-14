@@ -1,6 +1,7 @@
 package buggy
 
 import (
+	"errors"
 	"io"
 	"os"
 )
@@ -27,6 +28,25 @@ func WriteLogLeaky(path string, line string) error {
 		return err
 	}
 	_, err = f.WriteString(line + "\n")
+	return err
+}
+
+// WriteReportPartialClose closes on the happy path, but two early returns
+// between the open and the close registration leak the handle — must be
+// graded FD LEAK WARN (the immediate error guard is exempt).
+func WriteReportPartialClose(path string, data []byte) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err // handle never valid — exempt
+	}
+	if len(data) == 0 {
+		return errors.New("no data") // leaks f
+	}
+	if len(data) > 1<<20 {
+		return errors.New("too large") // leaks f
+	}
+	defer f.Close()
+	_, err = f.Write(data)
 	return err
 }
 
