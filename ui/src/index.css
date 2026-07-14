@@ -432,6 +432,28 @@ body {
   color: var(--dim);
 }
 
+.b-race {
+  background: color-mix(in srgb, var(--err) 22%, transparent);
+  color: var(--err);
+}
+
+.b-fd {
+  background: color-mix(in srgb, var(--amber) 20%, transparent);
+  color: var(--amber);
+}
+
+.b-leak {
+  background: color-mix(in srgb, var(--violet) 20%, transparent);
+  color: var(--violet);
+}
+
+.k-race .text,
+.k-fd-leak .text,
+.k-go-leak .text,
+.k-chan-closed .text {
+  font-weight: 600;
+}
+
 /* variables — colored by alias-class id (v0..v9), clickable to track */
 
 .var {

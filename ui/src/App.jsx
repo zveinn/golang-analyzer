@@ -12,11 +12,80 @@ function tagIds(node, counter) {
   node.kids?.forEach((k) => tagIds(k, counter))
 }
 
+// ---- localStorage persistence ----
+
+const STORAGE_KEY = 'code-analyzer.traces.v1'
+const STORAGE_MAX_ITEMS = 30
+const STORAGE_MAX_BYTES = 4_000_000
+
+// dedupeKey identifies an envelope so restored storage and the server's
+// history replay don't produce duplicates.
+function dedupeKey(m) {
+  return `${m.type}|${m.target}|${m.time}`
+}
+
+function prepare(msg) {
+  msg.id = nextTraceId++
+  if (msg.root) {
+    const counter = { n: 0 }
+    tagIds(msg.root, counter)
+    msg.nodeCount = counter.n
+  }
+  return msg
+}
+
+function loadStored() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return []
+    const arr = JSON.parse(raw)
+    if (!Array.isArray(arr)) return []
+    return arr.map(prepare)
+  } catch {
+    return []
+  }
+}
+
+function saveStored(traces) {
+  try {
+    let list = traces.slice(0, STORAGE_MAX_ITEMS)
+    let raw = JSON.stringify(list)
+    // stay under the quota: drop oldest entries (list is newest-first)
+    while (raw.length > STORAGE_MAX_BYTES && list.length > 1) {
+      list = list.slice(0, list.length - 1)
+      raw = JSON.stringify(list)
+    }
+    localStorage.setItem(STORAGE_KEY, raw)
+  } catch {
+    try {
+      localStorage.removeItem(STORAGE_KEY)
+    } catch {
+      /* storage unavailable — view-only mode */
+    }
+  }
+}
+
+function clearStored() {
+  try {
+    localStorage.removeItem(STORAGE_KEY)
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+const initialTraces = loadStored()
+
 export default function App() {
-  const [traces, setTraces] = useState([])
-  const [selectedId, setSelectedId] = useState(null)
+  const [traces, setTraces] = useState(initialTraces)
+  const [selectedId, setSelectedId] = useState(initialTraces[0]?.id ?? null)
   const [status, setStatus] = useState('connecting')
   const followLatest = useRef(true)
+  const seen = useRef(new Set(initialTraces.map(dedupeKey)))
+
+  // persist the list whenever it changes
+  useEffect(() => {
+    saveStored(traces)
+  }, [traces])
 
   useEffect(() => {
     let closed = false
@@ -33,12 +102,10 @@ export default function App() {
         } catch {
           msg = { type: 'error', target: 'malformed message', text: String(ev.data) }
         }
-        msg.id = nextTraceId++
-        if (msg.root) {
-          const counter = { n: 0 }
-          tagIds(msg.root, counter)
-          msg.nodeCount = counter.n
-        }
+        const key = dedupeKey(msg)
+        if (seen.current.has(key)) return // already restored from storage
+        seen.current.add(key)
+        prepare(msg)
         setTraces((prev) => [msg, ...prev].slice(0, 100))
         if (followLatest.current) setSelectedId(msg.id)
       }
@@ -80,13 +147,16 @@ export default function App() {
         {traces.length > 0 && (
           <button
             className="ghost clear-all"
+            title="clears the list and local storage"
             onClick={() => {
               setTraces([])
               setSelectedId(null)
               followLatest.current = true
+              seen.current = new Set()
+              clearStored()
             }}
           >
-            clear all
+            clear all + storage
           </button>
         )}
       </aside>

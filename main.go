@@ -11,12 +11,17 @@ func usage() {
 
 Starts the code-analyzer server:
   - web UI on http://%[2]s
-  - TCP intake on %[3]s accepting "file:line[:param:value]..." requests
+  - TCP intake on %[3]s accepting:
+      file:line[:param:value]...   trace the function at file:line
+      scan:dir                     scan every .go file under dir for
+                                   data races, closed-channel writes,
+                                   unclosed files and goroutine leaks
 
 Analysis is triggered exclusively via the TCP intake — use ./client:
   ./client <file.go> <line> [param value]...
+  ./client scan <dir>
 
-Parameters:
+Trace parameters:
   depth  <n>          max call-expansion depth (default %[4]d)
   expand once|all     expand each function body once (default) or at
                       every call site

@@ -80,6 +80,12 @@ func newAnalyzer(absFile string) (*analyzer, error) {
 	if err != nil {
 		return nil, err
 	}
+	return newAnalyzerAt(modRoot)
+}
+
+// newAnalyzerAt loads and indexes every Go package under dir (only .go
+// files are parsed — that is all packages.Load considers).
+func newAnalyzerAt(dir string) (*analyzer, error) {
 	cwd, _ := os.Getwd()
 	a := &analyzer{
 		fset:         token.NewFileSet(),
@@ -98,7 +104,7 @@ func newAnalyzer(absFile string) (*analyzer, error) {
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
 			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports |
 			packages.NeedDeps | packages.NeedModule,
-		Dir:  modRoot,
+		Dir:  dir,
 		Fset: a.fset,
 	}
 	pkgs, err := packages.Load(cfg, "./...")
@@ -106,7 +112,7 @@ func newAnalyzer(absFile string) (*analyzer, error) {
 		return nil, fmt.Errorf("loading packages: %w", err)
 	}
 	if len(pkgs) == 0 {
-		return nil, fmt.Errorf("no packages found under %s", modRoot)
+		return nil, fmt.Errorf("no Go packages found under %s", dir)
 	}
 	for _, p := range pkgs {
 		for _, e := range p.Errors {
@@ -422,7 +428,16 @@ func (a *analyzer) findFunc(absFile string, line int) (*target, error) {
 // enclosingFuncName names the function containing pos, for channel endpoint
 // reporting. Nested function literals are suffixed with ".func".
 func (a *analyzer) enclosingFuncName(p *packages.Package, f *ast.File, pos token.Pos) string {
+	name, _ := a.enclosingFuncInfo(p, f, pos)
+	return name
+}
+
+// enclosingFuncInfo returns the name and the position of the innermost
+// function (declaration or literal) containing pos. The position uniquely
+// identifies the function, unlike the name.
+func (a *analyzer) enclosingFuncInfo(p *packages.Package, f *ast.File, pos token.Pos) (string, token.Pos) {
 	name := p.Name + ".<init>"
+	fnPos := f.Pos()
 	ast.Inspect(f, func(n ast.Node) bool {
 		if n == nil {
 			return false
@@ -433,12 +448,14 @@ func (a *analyzer) enclosingFuncName(p *packages.Package, f *ast.File, pos token
 		switch d := n.(type) {
 		case *ast.FuncDecl:
 			name = p.Name + "." + funcDeclName(d)
+			fnPos = d.Pos()
 		case *ast.FuncLit:
 			name += ".func"
+			fnPos = d.Pos()
 		}
 		return true
 	})
-	return name
+	return name, fnPos
 }
 
 func funcDeclName(d *ast.FuncDecl) string {

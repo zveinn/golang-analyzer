@@ -31,10 +31,11 @@ func (k chanOpKind) String() string {
 
 // chanOp is one channel operation somewhere in the module.
 type chanOp struct {
-	kind chanOpKind
-	key  any // alias key of the channel expression; nil if dynamic
-	pos  token.Pos
-	fn   string // enclosing function, e.g. "main.worker"
+	kind  chanOpKind
+	key   any // alias key of the channel expression; nil if dynamic
+	pos   token.Pos
+	fn    string    // enclosing function, e.g. "main.worker"
+	fnPos token.Pos // position of the enclosing function (unique identity)
 }
 
 // resultKey identifies "result #idx of function fn" so channels returned
@@ -49,11 +50,13 @@ func (a *analyzer) recordChanOp(p *packages.Package, f *ast.File, kind chanOpKin
 	if !isChanType(p.TypesInfo.TypeOf(ch)) {
 		return
 	}
+	fn, fnPos := a.enclosingFuncInfo(p, f, pos)
 	a.chanOps = append(a.chanOps, chanOp{
-		kind: kind,
-		key:  a.chanKey(p.TypesInfo, ch),
-		pos:  pos,
-		fn:   a.enclosingFuncName(p, f, pos),
+		kind:  kind,
+		key:   a.chanKey(p.TypesInfo, ch),
+		pos:   pos,
+		fn:    fn,
+		fnPos: fnPos,
 	})
 }
 

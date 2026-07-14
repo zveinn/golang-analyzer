@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { downloadMarkdown } from './exportMd.js'
 
 // Badge text/colors per node kind. Purely presentational — the kinds are
 // decided by the backend.
@@ -17,6 +18,10 @@ const BADGES = {
   defer: { text: 'defer', cls: 'b-defer' },
   arg: { text: 'arg', cls: 'b-arg' },
   param: { text: 'param', cls: 'b-arg' },
+  race: { text: 'race', cls: 'b-race' },
+  'chan-closed': { text: 'closed ch', cls: 'b-close' },
+  'fd-leak': { text: 'fd leak', cls: 'b-fd' },
+  'go-leak': { text: 'leak', cls: 'b-leak' },
   peer: { text: 'peer', cls: 'b-peer' },
   note: { text: 'ℹ', cls: 'b-note' },
 }
@@ -150,6 +155,11 @@ export default function TraceView({ trace }) {
           </button>
         )}
         <span className="toolbar-gap" />
+        {trace.type === 'scan' && (
+          <button className="ghost" onClick={() => downloadMarkdown(trace)} title="download this scan as a markdown report">
+            export .md
+          </button>
+        )}
         <button className="ghost" onClick={() => setCollapsed(new Set())}>
           expand all
         </button>

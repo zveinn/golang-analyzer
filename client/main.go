@@ -1,8 +1,14 @@
 // Command client sends a single analysis request to the code-analyzer
 // server's TCP intake and prints the acknowledgement.
 //
-// usage: client <file.go> <line> [param value]...
-// example: client examples/main.go 36 depth 10 expand all
+// usage: client <file.go> <line> [param value]...   trace a function
+//
+//	client scan <dir>                           scan a repository
+//
+// examples:
+//
+//	client examples/main.go 36 depth 10 expand all
+//	client scan ./examples
 package main
 
 import (
@@ -21,17 +27,22 @@ func main() {
 	args := os.Args[1:]
 	if len(args) < 2 || len(args)%2 != 0 {
 		fmt.Fprintf(os.Stderr, `usage: %s <file.go> <line> [param value]...
+       %s scan <dir>
 
-Sends "file:line[:param:value]..." to the code-analyzer TCP intake
-(%s, override with CODE_ANALYZER_ADDR).
-`, filepath.Base(os.Args[0]), defaultAddr)
+Sends "file:line[:param:value]..." or "scan:dir" to the code-analyzer TCP
+intake (%s, override with CODE_ANALYZER_ADDR).
+`, filepath.Base(os.Args[0]), filepath.Base(os.Args[0]), defaultAddr)
 		os.Exit(2)
 	}
 
 	// The server resolves relative paths against its own working directory,
-	// so send an absolute path.
-	if abs, err := filepath.Abs(args[0]); err == nil {
-		args[0] = abs
+	// so send an absolute path (the file to trace, or the directory to scan).
+	pathArg := 0
+	if args[0] == "scan" {
+		pathArg = 1
+	}
+	if abs, err := filepath.Abs(args[pathArg]); err == nil {
+		args[pathArg] = abs
 	}
 
 	addr := os.Getenv("CODE_ANALYZER_ADDR")

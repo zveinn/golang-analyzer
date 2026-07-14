@@ -26,8 +26,14 @@ $ go build -o client/client ./client               # TCP client
 
 ```
 $ ./code-analyzer                # UI on http://0.0.0.0:1111, TCP intake on :1112
+
+# trace a function
 $ ./client/client <file.go> <line> [param value]...
 $ ./client/client examples/main.go 36 depth 10 expand all
+
+# scan a repository
+$ ./client/client scan <dir>
+$ ./client/client scan examples/buggy
 ```
 
 Analysis is triggered exclusively through the TCP intake on **:1112**, which
@@ -44,6 +50,10 @@ tree with the source position of every entry in a left gutter, kind badges
 local/stdlib/module chips, live text filtering, and expand/collapse-all.
 It renders the backend's tree verbatim — no code analysis happens
 client-side, the UI only maps backend-provided node kinds to styling.
+Received traces and scans are persisted in the browser's localStorage
+(last 30, ~4 MB cap) and restored on reload, deduplicated against the
+server's history replay; the sidebar's **clear all + storage** button wipes
+both the list and the stored copy.
 
 Supported parameters:
 
@@ -76,6 +86,28 @@ return values share one ID, computed by the backend's union-find. The UI
 colors variables by ID and, when one is clicked, highlights every occurrence
 and auto-expands each collapsed path the variable propagates through — all
 without doing any analysis client-side.
+
+## Repo scanner
+
+`scan:<dir>` loads every Go package under `<dir>` (only `.go` files are
+parsed) and runs four whole-repo detectors; results appear in the UI as the
+same navigable tree, with per-category counts and evidence rows:
+
+| Finding | Heuristic |
+| --- | --- |
+| **potential data races** | a variable captured by a `go func(){…}` closure that is written on one side of the goroutine boundary and accessed on the other, with no channel/sync/atomic/context type involved. Range and loop-local variables are per-iteration (Go ≥ 1.22) and only race with same-iteration accesses. |
+| **writes to closed channels** | a send following a `close` of the same channel in one sequential function flow, and channels closed by a function that isn't one of their senders while senders exist elsewhere (closes preceded by `sync.WaitGroup.Wait` count as coordinated). |
+| **unclosed file handles** | `*os.File` values bound to a variable whose alias class is never `Close()`d anywhere in the module and never returned to a caller. |
+| **potential goroutine leaks** | goroutines blocking on a channel op with no counterpart anywhere in the module (ops inside multi-case selects are exempt), and goroutines spinning in an infinite loop with no return, break or channel wait. |
+
+The detectors are heuristics — findings are labeled "potential" and each
+carries the evidence positions (launch site, conflicting access, closer,
+senders) to judge quickly. Scan views have an **export .md** button in the
+UI toolbar that downloads the report as structured markdown (categories as
+sections, numbered findings with positions, evidence as nested bullets). Scanning is fast enough for large codebases
+(~900-file repos in ~4s, ~2300-file repos in ~8s). `examples/buggy`
+contains a planted specimen of every finding plus correct variants that
+must not be flagged.
 
 ## Trace vocabulary
 

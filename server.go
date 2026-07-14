@@ -153,26 +153,44 @@ func (h *hub) handleTCP(conn net.Conn) {
 	}
 }
 
-// process handles one "file:line[:param:value]..." request: run the
-// analysis, push the result to the UI, and return an ack for the TCP client.
+// process handles one request from the TCP intake:
+//
+//	file:line[:param:value]...   trace the function at file:line
+//	scan:dir                     scan every .go file under dir
+//
+// The analysis result is pushed to the UI; the return value is the ack for
+// the TCP client.
 func (h *hub) process(msg string) string {
 	now := time.Now().Format("15:04:05")
-	file, line, params, err := parseRequest(msg)
+	req, err := parseRequest(msg)
 	if err != nil {
 		h.broadcast(wsMessage{Type: "error", Target: msg, Time: now, Text: err.Error()})
 		return "error: " + err.Error()
 	}
-	target := fmt.Sprintf("%s:%d", file, line)
-	log.Printf("analyzing %s %v", target, params)
 
+	if req.scan {
+		log.Printf("scanning %s", req.dir)
+		h.analyzeMu.Lock()
+		root, err := runScan(req.dir, req.params)
+		h.analyzeMu.Unlock()
+		if err != nil {
+			h.broadcast(wsMessage{Type: "error", Target: req.dir, Time: now, Text: err.Error()})
+			return "error: " + err.Error()
+		}
+		h.broadcast(wsMessage{Type: "scan", Target: req.dir, Time: now, Root: root})
+		return fmt.Sprintf("ok: scan of %s pushed to UI (%d findings)", req.dir, countFindings(root))
+	}
+
+	target := fmt.Sprintf("%s:%d", req.file, req.line)
+	log.Printf("analyzing %s %v", target, req.params)
 	h.analyzeMu.Lock()
-	root, err := runTrace(file, line, params)
+	root, err := runTrace(req.file, req.line, req.params)
 	h.analyzeMu.Unlock()
 	if err != nil {
-		h.broadcast(wsMessage{Type: "error", Target: target, Params: params, Time: now, Text: err.Error()})
+		h.broadcast(wsMessage{Type: "error", Target: target, Params: req.params, Time: now, Text: err.Error()})
 		return "error: " + err.Error()
 	}
-	h.broadcast(wsMessage{Type: "trace", Target: target, Params: params, Time: now, Root: root})
+	h.broadcast(wsMessage{Type: "trace", Target: target, Params: req.params, Time: now, Root: root})
 	return fmt.Sprintf("ok: trace of %s pushed to UI (%d nodes)", target, countNodes(root))
 }
 
@@ -184,25 +202,42 @@ func countNodes(n *node) int {
 	return total
 }
 
-func parseRequest(msg string) (file string, line int, params map[string]string, err error) {
+type request struct {
+	scan   bool
+	file   string
+	line   int
+	dir    string
+	params map[string]string
+}
+
+func parseRequest(msg string) (*request, error) {
 	parts := strings.Split(msg, ":")
 	if len(parts) < 2 {
-		return "", 0, nil, fmt.Errorf("bad request %q (want file:line[:param:value]...)", msg)
+		return nil, fmt.Errorf("bad request %q (want file:line[:param:value]... or scan:dir)", msg)
 	}
-	file = parts[0]
-	line, err = strconv.Atoi(parts[1])
-	if err != nil || line < 1 {
-		return "", 0, nil, fmt.Errorf("bad line number %q in %q", parts[1], msg)
+	var req request
+	var rest []string
+	if parts[0] == "scan" {
+		req.scan = true
+		req.dir = parts[1]
+		rest = parts[2:]
+	} else {
+		req.file = parts[0]
+		line, err := strconv.Atoi(parts[1])
+		if err != nil || line < 1 {
+			return nil, fmt.Errorf("bad line number %q in %q", parts[1], msg)
+		}
+		req.line = line
+		rest = parts[2:]
 	}
-	rest := parts[2:]
 	if len(rest)%2 != 0 {
-		return "", 0, nil, fmt.Errorf("parameters must be key:value pairs, got %q", strings.Join(rest, ":"))
+		return nil, fmt.Errorf("parameters must be key:value pairs, got %q", strings.Join(rest, ":"))
 	}
 	if len(rest) > 0 {
-		params = make(map[string]string, len(rest)/2)
+		req.params = make(map[string]string, len(rest)/2)
 		for i := 0; i < len(rest); i += 2 {
-			params[rest[i]] = rest[i+1]
+			req.params[rest[i]] = rest[i+1]
 		}
 	}
-	return file, line, params, nil
+	return &req, nil
 }
