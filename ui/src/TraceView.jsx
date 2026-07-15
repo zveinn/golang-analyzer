@@ -33,16 +33,30 @@ const BADGES = {
 
 const VAR_PALETTE_SIZE = 10
 
-// Kinds rendered as a leading code keyword rather than a badge.
-const KW = { go: 'go', defer: 'defer', select: 'select', return: 'return' }
+// Leading Go keywords to syntax-highlight, longest first so multi-word forms
+// win ("for range" before "for", "else if" before "else").
+const GO_KEYWORDS = [
+  'type switch', 'for range', 'else if',
+  'default', 'return', 'select', 'switch',
+  'defer', 'range', 'case', 'else', 'func', 'for', 'var', 'go', 'if',
+]
 
-// Kinds whose meaning is already carried by the row text (a keyword, an arrow,
-// or the "←" of an annotation), so a badge would just add noise.
-const HIDE_BADGE = new Set([
-  'go', 'defer', 'select', 'return',
-  'chan-send', 'chan-recv', 'chan-close',
-  'arg', 'param', 'peer',
-])
+function splitKeyword(text) {
+  for (const kw of GO_KEYWORDS) {
+    if (text === kw) return [kw, '']
+    if (text.startsWith(kw)) {
+      const c = text[kw.length]
+      if (c === ' ' || c === '\t' || c === ':') return [kw, text.slice(kw.length)]
+    }
+  }
+  return [null, text]
+}
+
+// In code view (traces, not scans) these annotation kinds are dropped
+// entirely — the tracing colors already convey the data flow.
+const HIDDEN_KINDS = new Set(['arg', 'param', 'peer'])
+// …and these are shown as dim `// comments` since they aren't literal code.
+const COMMENT_KINDS = new Set(['note', 'impl', 'bound'])
 
 function walk(n, fn) {
   fn(n)
@@ -137,6 +151,9 @@ export default function TraceView({ trace }) {
     setCollapsed((prev) => new Set([...prev].filter((id) => !onPath.has(id))))
   }
 
+  // Traces render as clean Go-code lines; scans keep their badges/findings.
+  const codeView = trace.type !== 'scan'
+
   return (
     <div className="trace-view">
       <div className="trace-header">
@@ -184,7 +201,7 @@ export default function TraceView({ trace }) {
         </button>
       </div>
 
-      <div className="tree">
+      <div className={`tree ${codeView ? 'code' : ''}`}>
         <Row
           n={trace.root}
           depth={0}
@@ -193,17 +210,15 @@ export default function TraceView({ trace }) {
           visible={visible}
           tracked={tracked}
           onVarClick={clickVar}
+          codeView={codeView}
         />
       </div>
 
       <div className="legend">
-        <span className="chip label-stdlib">stdlib</span> /{' '}
-        <span className="chip label-module">module</span> not traced into ·{' '}
-        <span className="kw kw-go">go</span>
-        <span className="kw kw-defer">defer</span>
-        <span className="kw kw-return">return</span> keywords ·{' '}
+        <span className="kw">func</span> keyword ·{' '}
         <span className="var v3 legend-var">variable</span> click to track ·{' '}
-        <span className="var v0 legend-var var-ret">value</span> returned
+        <span className="var v0 legend-var var-ret">value</span> returned ·{' '}
+        <span className="code-comment">// note</span> dispatch / info
       </div>
     </div>
   )
@@ -225,27 +240,25 @@ function VarSpan({ s, tracked, onVarClick }) {
 }
 
 function NodeText({ n, tracked, onVarClick }) {
-  const kw = KW[n.kind]
-  const keyword = kw ? <span className={`kw kw-${n.kind}`}>{kw}</span> : null
-
-  // Plain-text node (no variable spans), e.g. defer/select/note.
+  // Plain-text node (no variable spans): highlight a leading keyword if any.
   if (!n.spans) {
-    const rest = kw && n.text.trim() === kw ? '' : n.text
+    const [kw, rest] = splitKeyword(n.text)
     return (
       <span className="text">
-        {keyword}
+        {kw && <span className="kw">{kw}</span>}
         {rest}
       </span>
     )
   }
 
-  // Strip a leading keyword already present in the text so it isn't shown
-  // twice (the colored keyword token replaces it).
+  // Spans node: peel a leading keyword off the first plain span and color it.
   let spans = n.spans
-  if (kw && spans.length && !spans[0].v) {
-    const trimmed = spans[0].t.replace(/^\s+/, '')
-    if (trimmed.startsWith(kw)) {
-      spans = [{ ...spans[0], t: trimmed.slice(kw.length).replace(/^\s+/, '') }, ...spans.slice(1)]
+  let keyword = null
+  if (spans.length && !spans[0].v) {
+    const [kw, rest] = splitKeyword(spans[0].t)
+    if (kw) {
+      keyword = <span className="kw">{kw}</span>
+      spans = [{ ...spans[0], t: rest }, ...spans.slice(1)]
     }
   }
 
@@ -263,14 +276,17 @@ function NodeText({ n, tracked, onVarClick }) {
   )
 }
 
-function Row({ n, depth, collapsed, onToggle, visible, tracked, onVarClick }) {
+function Row({ n, depth, collapsed, onToggle, visible, tracked, onVarClick, codeView }) {
   if (visible && !visible.has(n._id)) return null
+  // Code view: drop pure data-flow annotation rows — the colors carry it.
+  if (codeView && HIDDEN_KINDS.has(n.kind)) return null
   const kids = n.kids ?? []
   const isCollapsed = !visible && collapsed.has(n._id)
   const badge = BADGES[n.kind]
-  const showBadge = badge && !HIDE_BADGE.has(n.kind)
+  const showBadge = !codeView && badge
   const badgeText = n.kind === 'loop' && n.num ? `loop ${n.num}` : badge?.text
   const hit = tracked && nodeHasVar(n, tracked.v)
+  const comment = codeView && COMMENT_KINDS.has(n.kind)
 
   return (
     <>
@@ -287,8 +303,12 @@ function Row({ n, depth, collapsed, onToggle, visible, tracked, onVarClick }) {
             <span className="disc spacer" />
           )}
           {showBadge && <span className={`badge ${badge.cls}`}>{badgeText}</span>}
-          <NodeText n={n} tracked={tracked} onVarClick={onVarClick} />
-          {n.label && <span className={`chip label-${n.label}`}>{n.label}</span>}
+          {comment ? (
+            <span className="text code-comment">// {n.text}</span>
+          ) : (
+            <NodeText n={n} tracked={tracked} onVarClick={onVarClick} />
+          )}
+          {!codeView && n.label && <span className={`chip label-${n.label}`}>{n.label}</span>}
           {isCollapsed && <span className="hidden-count">+{countSubtree(n) - 1} hidden</span>}
         </span>
       </div>
@@ -303,6 +323,7 @@ function Row({ n, depth, collapsed, onToggle, visible, tracked, onVarClick }) {
             visible={visible}
             tracked={tracked}
             onVarClick={onVarClick}
+            codeView={codeView}
           />
         ))}
     </>

@@ -5,13 +5,17 @@ import (
 	"go/token"
 	"go/types"
 	"slices"
-	"strings"
 
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/types/typeutil"
 )
 
-// trace walks the target function and produces the execution trace tree.
+const lineBudget = 200
+
+// trace walks the target function and produces the execution trace tree: a
+// verbatim, line-by-line rendering of the source along the execution path,
+// with every variable highlighted for tracking. Local calls are expanded
+// inline — the callee's body is nested beneath the line that made the call.
 func (a *analyzer) trace(t *target) *node {
 	root := nodeWithSpans(a.relPos(t.def.decl.Pos()), "root", "local",
 		a.rootSpans(t.def.pkg, t.def.decl))
@@ -20,9 +24,7 @@ func (a *analyzer) trace(t *target) *node {
 	}
 	a.expandedAt[t.fn.Origin()] = a.relPos(t.def.decl.Pos())
 	a.stack = append(a.stack, t.fn.Origin())
-	a.resultStack = append(a.resultStack, t.def.decl.Type.Results)
 	a.block(t.def.pkg, t.def.decl.Body, root)
-	a.resultStack = a.resultStack[:len(a.resultStack)-1]
 	a.stack = a.stack[:0]
 	prune(root)
 	var loops int
@@ -55,239 +57,221 @@ func (a *analyzer) block(p *packages.Package, b *ast.BlockStmt, parent *node) {
 	}
 }
 
+// line builds a node holding the verbatim source of [start,end) with every
+// variable occurrence marked for tracking.
+func (a *analyzer) line(p *packages.Package, kind string, start, end token.Pos, root ast.Node) *node {
+	return nodeWithSpans(a.relPos(start), kind, "",
+		truncateSpans(a.spansForRange(p, start, end, root), lineBudget))
+}
+
+// header renders a compound statement's opening line up to and including the
+// block's "{" ("if cond {", "for … {", "switch x {").
+func (a *analyzer) header(p *packages.Package, kind string, start token.Pos, body *ast.BlockStmt, root ast.Node) *node {
+	return a.line(p, kind, start, body.Lbrace+1, root)
+}
+
+// stmt renders one statement as its source line(s) and expands the local calls
+// it makes (their bodies nested beneath).
 func (a *analyzer) stmt(p *packages.Package, s ast.Stmt, parent *node) {
 	if s == nil || a.full() {
 		return
 	}
 	switch x := s.(type) {
-	case *ast.ExprStmt:
-		a.expr(p, x.X, parent)
-	case *ast.AssignStmt:
-		if len(x.Rhs) == 1 {
-			before := len(parent.Kids)
-			a.expr(p, x.Rhs[0], parent)
-			a.prependAssign(p, x.Lhs, x.Rhs[0], parent, before)
-		} else {
-			for i, e := range x.Rhs {
-				before := len(parent.Kids)
-				a.expr(p, e, parent)
-				if i < len(x.Lhs) {
-					a.prependAssign(p, x.Lhs[i:i+1], e, parent, before)
-				}
+	case *ast.IfStmt:
+		if x.Init != nil {
+			a.stmt(p, x.Init, parent)
+		}
+		hn := parent.add(a.header(p, "branch", x.If, x.Body, x))
+		a.expandCallsIn(p, x.Cond, hn)
+		a.block(p, x.Body, hn)
+		if x.Else != nil {
+			if blk, ok := x.Else.(*ast.BlockStmt); ok {
+				en := parent.add(&node{Pos: a.relPos(x.Else.Pos()), Kind: "branch", Text: "} else {"})
+				a.block(p, blk, en)
+			} else {
+				a.stmt(p, x.Else, parent) // "else if …"
 			}
 		}
-		for _, e := range x.Lhs {
-			a.expr(p, e, parent)
+	case *ast.ForStmt:
+		if x.Init != nil {
+			a.stmt(p, x.Init, parent)
 		}
-	case *ast.GoStmt:
-		spans := []span{{T: "go func literal(…)"}}
-		if _, ok := ast.Unparen(x.Call.Fun).(*ast.FuncLit); !ok {
-			spans = append(truncateSpans(append([]span{{T: "go "}}, a.exprSpans(p, x.Call.Fun)...), 60), span{T: "(…)"})
+		hn := parent.add(a.header(p, "loop", x.For, x.Body, x))
+		hn.loop = true
+		a.expandCallsIn(p, x.Cond, hn)
+		a.block(p, x.Body, hn)
+		a.expandCallsIn(p, x.Post, hn)
+	case *ast.RangeStmt:
+		hn := parent.add(a.header(p, "loop", x.For, x.Body, x))
+		hn.loop = true
+		a.expandCallsIn(p, x.X, hn)
+		a.block(p, x.Body, hn)
+	case *ast.SwitchStmt:
+		if x.Init != nil {
+			a.stmt(p, x.Init, parent)
 		}
-		gn := parent.add(nodeWithSpans(a.relPos(x.Pos()), "go", "", spans))
-		a.call(p, x.Call, gn)
-	case *ast.DeferStmt:
-		dn := parent.add(&node{Pos: a.relPos(x.Pos()), Kind: "defer", Text: "defer", structural: true})
-		a.call(p, x.Call, dn)
-	case *ast.SendStmt:
-		a.expr(p, x.Value, parent)
-		a.chanEvent(p, chanSend, x.Chan, x.Value, x.Arrow, parent)
-	case *ast.IfStmt:
-		a.stmt(p, x.Init, parent)
-		in := parent.add(a.structuralNode(p, a.relPos(x.If), "branch", "if ", x.Cond))
-		a.expr(p, x.Cond, in)
-		a.block(p, x.Body, in)
-		if x.Else != nil {
-			en := parent.add(&node{Pos: a.relPos(x.Else.Pos()), Kind: "branch", Text: "else", structural: true})
-			a.stmt(p, x.Else, en)
+		hn := parent.add(a.header(p, "branch", x.Switch, x.Body, x))
+		a.expandCallsIn(p, x.Tag, hn)
+		a.caseClauses(p, x.Body, hn)
+	case *ast.TypeSwitchStmt:
+		if x.Init != nil {
+			a.stmt(p, x.Init, parent)
 		}
+		hn := parent.add(a.header(p, "branch", x.Switch, x.Body, x))
+		a.caseClauses(p, x.Body, hn)
+	case *ast.SelectStmt:
+		hn := parent.add(&node{Pos: a.relPos(x.Pos()), Kind: "select", Text: "select {"})
+		a.caseClauses(p, x.Body, hn)
 	case *ast.BlockStmt:
 		a.block(p, x, parent)
-	case *ast.ForStmt:
-		a.stmt(p, x.Init, parent)
-		ln := a.structuralNode(p, a.relPos(x.For), "loop", "for", nil)
-		if x.Cond != nil {
-			ln = a.structuralNode(p, a.relPos(x.For), "loop", "for ", x.Cond)
+	case *ast.LabeledStmt:
+		a.stmt(p, x.Stmt, parent)
+	case *ast.GoStmt:
+		a.stmtCall(p, x, x.Call, parent)
+	case *ast.DeferStmt:
+		a.stmtCall(p, x, x.Call, parent)
+	default:
+		ln := parent.add(a.line(p, stmtKind(s), s.Pos(), s.End(), s))
+		a.expandCallsIn(p, s, ln)
+	}
+}
+
+func stmtKind(s ast.Stmt) string {
+	switch s.(type) {
+	case *ast.ReturnStmt:
+		return "return"
+	case *ast.SendStmt:
+		return "chan-send"
+	}
+	return "stmt"
+}
+
+// stmtCall renders a `go`/`defer` statement as one verbatim line and expands
+// the called function/closure beneath it. For an inline closure, only the
+// header up to its body "{" is shown (the body becomes the nested children).
+func (a *analyzer) stmtCall(p *packages.Package, stmt ast.Node, call *ast.CallExpr, parent *node) {
+	if lit, ok := ast.Unparen(call.Fun).(*ast.FuncLit); ok {
+		hn := parent.add(a.line(p, "stmt", stmt.Pos(), lit.Body.Lbrace+1, stmt))
+		a.expandLit(p, lit, a.relPos(call.Lparen), hn)
+		for _, arg := range call.Args {
+			a.expandCallsIn(p, arg, hn)
 		}
-		ln.loop = true
-		parent.add(ln)
-		a.expr(p, x.Cond, ln)
-		a.block(p, x.Body, ln)
-		a.stmt(p, x.Post, ln)
-	case *ast.RangeStmt:
-		a.expr(p, x.X, parent) // range expression is evaluated once, before the loop
-		ln := a.structuralNode(p, a.relPos(x.For), "loop", "for range ", x.X)
-		ln.loop = true
-		parent.add(ln)
-		if isChanType(p.TypesInfo.TypeOf(x.X)) {
-			a.chanEvent(p, chanRecv, x.X, nil, x.For, ln)
-		}
-		a.block(p, x.Body, ln)
-	case *ast.SwitchStmt:
-		a.stmt(p, x.Init, parent)
-		sn := a.structuralNode(p, a.relPos(x.Switch), "branch", "switch", nil)
-		if x.Tag != nil {
-			sn = a.structuralNode(p, a.relPos(x.Switch), "branch", "switch ", x.Tag)
-		}
-		parent.add(sn)
-		a.expr(p, x.Tag, sn)
-		a.caseClauses(p, x.Body, sn)
-	case *ast.TypeSwitchStmt:
-		a.stmt(p, x.Init, parent)
-		sn := parent.add(&node{Pos: a.relPos(x.Switch), Kind: "branch", Text: "type switch", structural: true})
-		a.stmt(p, x.Assign, sn)
-		a.caseClauses(p, x.Body, sn)
-	case *ast.SelectStmt:
-		sn := parent.add(&node{Pos: a.relPos(x.Pos()), Kind: "select", Text: "select", structural: true})
-		for _, c := range x.Body.List {
-			cc := c.(*ast.CommClause)
-			spans := []span{{T: "default:"}}
-			if cc.Comm != nil {
-				spans = append(append([]span{{T: "case "}}, a.commSpans(p, cc.Comm)...), span{T: ":"})
+		return
+	}
+	ln := parent.add(a.line(p, "stmt", stmt.Pos(), stmt.End(), stmt))
+	a.expandCallsIn(p, call, ln)
+}
+
+// caseClauses renders the case/comm clauses of a switch or select.
+func (a *analyzer) caseClauses(p *packages.Package, body *ast.BlockStmt, parent *node) {
+	for _, c := range body.List {
+		switch cc := c.(type) {
+		case *ast.CaseClause:
+			cn := parent.add(a.line(p, "case", cc.Case, cc.Colon+1, cc))
+			for _, e := range cc.List {
+				a.expandCallsIn(p, e, cn)
 			}
-			cn := sn.add(nodeWithSpans(a.relPos(cc.Case), "case", "", spans))
-			cn.structural = true
-			a.stmt(p, cc.Comm, cn)
+			for _, bs := range cc.Body {
+				a.stmt(p, bs, cn)
+			}
+		case *ast.CommClause:
+			cn := parent.add(a.line(p, "case", cc.Case, cc.Colon+1, cc))
+			a.expandCallsIn(p, cc.Comm, cn)
 			for _, bs := range cc.Body {
 				a.stmt(p, bs, cn)
 			}
 		}
-	case *ast.ReturnStmt:
-		rn := parent
-		if spans := a.returnSpans(p, x); spans != nil {
-			rn = parent.add(nodeWithSpans(a.relPos(x.Pos()), "return", "", spans))
-			a.annotateReturn(p, x, rn)
-		}
-		for _, e := range x.Results {
-			a.expr(p, e, rn)
-		}
-	case *ast.DeclStmt:
-		if gd, ok := x.Decl.(*ast.GenDecl); ok {
-			for _, spec := range gd.Specs {
-				if vs, ok := spec.(*ast.ValueSpec); ok {
-					names := make([]ast.Expr, len(vs.Names))
-					for i, n := range vs.Names {
-						names[i] = n
-					}
-					for i, v := range vs.Values {
-						before := len(parent.Kids)
-						a.expr(p, v, parent)
-						if len(vs.Values) == 1 {
-							a.prependAssign(p, names, v, parent, before)
-						} else if i < len(names) {
-							a.prependAssign(p, names[i:i+1], v, parent, before)
-						}
-					}
-				}
-			}
-		}
-	case *ast.LabeledStmt:
-		a.stmt(p, x.Stmt, parent)
-	case *ast.IncDecStmt:
-		a.expr(p, x.X, parent)
 	}
 }
 
-func (a *analyzer) caseClauses(p *packages.Package, body *ast.BlockStmt, parent *node) {
-	for _, c := range body.List {
-		cc, ok := c.(*ast.CaseClause)
+// expandCallsIn expands every local call found in an expression/statement,
+// nesting the callee bodies under parent. Function-literal bodies are not
+// descended into — they run only when invoked, handled at the call site.
+func (a *analyzer) expandCallsIn(p *packages.Package, root ast.Node, parent *node) {
+	if root == nil {
+		return
+	}
+	ast.Inspect(root, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.FuncLit:
+			return false
+		case *ast.CallExpr:
+			a.expandCall(p, x, parent)
+		}
+		return true
+	})
+}
+
+// expandCall resolves a call's callee and expands its body under parent,
+// without emitting a node for the call itself (the call already appears in the
+// enclosing source line). Nested calls in arguments/receiver are handled by
+// the caller's ast.Inspect walk.
+func (a *analyzer) expandCall(p *packages.Package, call *ast.CallExpr, parent *node) {
+	if a.full() {
+		return
+	}
+	info := p.TypesInfo
+	fun := ast.Unparen(call.Fun)
+	at := a.relPos(call.Lparen)
+
+	if lit, ok := fun.(*ast.FuncLit); ok {
+		a.expandLit(p, lit, at, parent)
+		return
+	}
+	switch callee := typeutil.Callee(info, call).(type) {
+	case *types.Func:
+		if recv := callee.Signature().Recv(); recv != nil && types.IsInterface(recv.Type()) {
+			sel, ok := fun.(*ast.SelectorExpr)
+			iface, _ := recv.Type().Underlying().(*types.Interface)
+			if ok && iface != nil {
+				resolved := dedupFuncs(a.concreteImpls(info, sel.X, iface, callee.Name()))
+				if len(resolved) == 1 && a.classify(resolved[0].Pkg()) == "local" {
+					a.expand(resolved[0], "local", at, parent)
+				}
+			}
+			return
+		}
+		a.expand(callee, a.classify(callee.Pkg()), at, parent)
+	case *types.Var:
+		a.expandFuncValue(p, callee, at, parent)
+	}
+}
+
+// expandFuncValue resolves a call through a function-typed variable and
+// expands the bound function/literal/method value, when statically known.
+func (a *analyzer) expandFuncValue(p *packages.Package, v *types.Var, at string, parent *node) {
+	site, ok := a.defs[v]
+	if !ok {
+		return
+	}
+	rhs := rhsForVar(site, v)
+	if rhs == nil {
+		return
+	}
+	info := site.pkg.TypesInfo
+	switch r := ast.Unparen(rhs).(type) {
+	case *ast.FuncLit:
+		a.expandLit(site.pkg, r, at, parent)
+	case *ast.Ident, *ast.SelectorExpr:
+		fn, ok := exprObj(info, r).(*types.Func)
 		if !ok {
-			continue
+			return
 		}
-		cn := parent.add(nodeWithSpans(a.relPos(cc.Case), "case", "", a.caseSpans(p, cc.List)))
-		cn.structural = true
-		for _, e := range cc.List {
-			a.expr(p, e, cn)
-		}
-		for _, bs := range cc.Body {
-			a.stmt(p, bs, cn)
-		}
-	}
-}
-
-func (a *analyzer) caseSpans(p *packages.Package, list []ast.Expr) []span {
-	if len(list) == 0 {
-		return []span{{T: "default:"}}
-	}
-	spans := []span{{T: "case "}}
-	for i, e := range list {
-		if i > 0 {
-			spans = append(spans, span{T: ", "})
-		}
-		spans = append(spans, a.exprSpans(p, e)...)
-	}
-	return append(truncateSpans(spans, 70), span{T: ":"})
-}
-
-// commSpans renders a select case's communication statement with variable
-// markers.
-func (a *analyzer) commSpans(p *packages.Package, s ast.Stmt) []span {
-	if spans := a.spansForRange(p, s.Pos(), s.End(), s); spans != nil {
-		return truncateSpans(spans, 70)
-	}
-	return []span{{T: "?"}}
-}
-
-// structuralNode builds a branch/loop header node like "if <cond>" with the
-// condition's variables marked.
-func (a *analyzer) structuralNode(p *packages.Package, pos, kind, head string, e ast.Expr) *node {
-	spans := []span{{T: head}}
-	if e != nil {
-		spans = append(spans, truncateSpans(a.exprSpans(p, e), 60)...)
-	}
-	n := nodeWithSpans(pos, kind, "", spans)
-	n.structural = true
-	return n
-}
-
-// returnSpans renders a return statement as "return a, b" with the returned
-// variables marked (R) so the UI can flag them red while keeping their
-// alias-class color. A bare `return` names the enclosing function's declared
-// results. Returns nil when there is nothing to show (a void return).
-func (a *analyzer) returnSpans(p *packages.Package, x *ast.ReturnStmt) []span {
-	var out []span
-	if len(x.Results) > 0 {
-		for i, e := range x.Results {
-			if i > 0 {
-				out = append(out, span{T: ", "})
-			}
-			out = append(out, a.exprSpans(p, e)...)
-		}
-	} else {
-		// Bare return: name the declared results of the enclosing function.
-		var results *ast.FieldList
-		if n := len(a.resultStack); n > 0 {
-			results = a.resultStack[n-1]
-		}
-		if results == nil {
-			return nil
-		}
-		for _, field := range results.List {
-			for _, name := range field.Names {
-				if name.Name == "_" {
-					continue
+		// A method value on an interface receiver (getFoo := iface.Method)
+		// resolves like an interface call: enter the concrete implementation.
+		if sel, isSel := r.(*ast.SelectorExpr); isSel {
+			if recv := fn.Signature().Recv(); recv != nil && types.IsInterface(recv.Type()) {
+				if iface, _ := recv.Type().Underlying().(*types.Interface); iface != nil {
+					resolved := dedupFuncs(a.concreteImpls(info, sel.X, iface, fn.Name()))
+					if len(resolved) == 1 && a.classify(resolved[0].Pkg()) == "local" {
+						a.expand(resolved[0], "local", at, parent)
+					}
 				}
-				if len(out) > 0 {
-					out = append(out, span{T: ", "})
-				}
-				sp := span{T: name.Name}
-				if v, ok := p.TypesInfo.Defs[name].(*types.Var); ok {
-					sp.V = a.varID(v)
-				}
-				out = append(out, sp)
+				return
 			}
 		}
+		a.expand(fn, a.classify(fn.Pkg()), at, parent)
 	}
-	if len(out) == 0 {
-		return nil // void return — nothing to mark
-	}
-	// Flag the returned variables (keep their alias-class color for tracking).
-	for i := range out {
-		if out[i].V != 0 {
-			out[i].R = true
-		}
-	}
-	return truncateSpans(out, 90)
 }
 
 // rootSpans renders the traced function's signature with its receiver and
@@ -299,283 +283,6 @@ func (a *analyzer) rootSpans(p *packages.Package, decl *ast.FuncDecl) []span {
 	}
 	spans := a.spansForRange(p, decl.Type.Pos(), decl.Type.End(), roots...)
 	return truncateSpans(spans, 120)
-}
-
-// expr walks an expression, emitting nodes for calls and channel receives.
-func (a *analyzer) expr(p *packages.Package, e ast.Expr, parent *node) {
-	switch x := e.(type) {
-	case nil:
-	case *ast.CallExpr:
-		a.call(p, x, parent)
-	case *ast.UnaryExpr:
-		a.expr(p, x.X, parent)
-		if x.Op == token.ARROW {
-			a.chanEvent(p, chanRecv, x.X, nil, x.OpPos, parent)
-		}
-	case *ast.BinaryExpr:
-		a.expr(p, x.X, parent)
-		a.expr(p, x.Y, parent)
-	case *ast.ParenExpr:
-		a.expr(p, x.X, parent)
-	case *ast.StarExpr:
-		a.expr(p, x.X, parent)
-	case *ast.TypeAssertExpr:
-		a.expr(p, x.X, parent)
-	case *ast.SelectorExpr:
-		a.expr(p, x.X, parent)
-	case *ast.IndexExpr:
-		a.expr(p, x.X, parent)
-		a.expr(p, x.Index, parent)
-	case *ast.IndexListExpr:
-		a.expr(p, x.X, parent)
-	case *ast.SliceExpr:
-		a.expr(p, x.X, parent)
-		a.expr(p, x.Low, parent)
-		a.expr(p, x.High, parent)
-		a.expr(p, x.Max, parent)
-	case *ast.CompositeLit:
-		for _, el := range x.Elts {
-			a.expr(p, el, parent)
-		}
-	case *ast.KeyValueExpr:
-		a.expr(p, x.Key, parent)
-		a.expr(p, x.Value, parent)
-	case *ast.FuncLit:
-		// A definition, not a call — its body runs only when invoked.
-	}
-}
-
-// call resolves and traces a single call expression.
-func (a *analyzer) call(p *packages.Package, call *ast.CallExpr, parent *node) {
-	if a.full() {
-		return
-	}
-	info := p.TypesInfo
-
-	// Type conversion, e.g. []byte(s) — not a function call.
-	if tv, ok := info.Types[call.Fun]; ok && tv.IsType() {
-		for _, arg := range call.Args {
-			a.expr(p, arg, parent)
-		}
-		return
-	}
-
-	fun := ast.Unparen(call.Fun)
-
-	// Immediately-invoked function literal: func(){...}()
-	if lit, ok := fun.(*ast.FuncLit); ok {
-		n := parent.add(&node{Pos: a.relPos(call.Lparen), Kind: "call", Label: "local", Text: "func literal()"})
-		a.walkArgs(p, call, nil, n)
-		a.expandLit(p, lit, a.relPos(call.Lparen), n)
-		return
-	}
-
-	switch callee := typeutil.Callee(info, call).(type) {
-	case *types.Builtin:
-		if callee.Name() == "close" && len(call.Args) == 1 {
-			a.chanEvent(p, chanClose, call.Args[0], nil, call.Pos(), parent)
-			return
-		}
-		// Other builtins (append, len, panic, …) are not traced as calls,
-		// but their arguments may contain calls.
-		for _, arg := range call.Args {
-			a.expr(p, arg, parent)
-		}
-	case *types.Func:
-		a.staticCall(p, call, callee, parent)
-	case *types.Var:
-		a.funcValueCall(p, call, callee, parent)
-	default:
-		n := parent.add(nodeWithSpans(a.relPos(call.Lparen), "indirect-call", "", a.callSpans(p, call)))
-		a.expr(p, call.Fun, n)
-		a.walkArgs(p, call, nil, n)
-	}
-}
-
-// callSpans renders a call expression as its exact source text with every
-// variable occurrence marked.
-func (a *analyzer) callSpans(p *packages.Package, call *ast.CallExpr) []span {
-	return truncateSpans(a.exprSpans(p, call), 90)
-}
-
-// boundCallSpans renders a local call with the caller→callee name mapping
-// inline — "(rb > r).ReadAlignedFrom(r > rd, size, …)" — so the rename is
-// visible in the call itself instead of on separate "param ← arg" rows. The
-// callee parameter names are marked as variables (same alias-class color as
-// the argument), so they stay clickable/trackable. The mapping is shown only
-// where the parameter name differs from the argument text.
-func (a *analyzer) boundCallSpans(p *packages.Package, call *ast.CallExpr, fn *types.Func) []span {
-	sig := fn.Origin().Signature()
-	var out []span
-	if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok {
-		recvSpans := a.exprSpans(p, sel.X)
-		if recv := sig.Recv(); recv != nil && recv.Name() != "" && recv.Name() != "_" &&
-			spansText(recvSpans) != recv.Name() {
-			out = append(out, span{T: "("})
-			out = append(out, recvSpans...)
-			out = append(out, span{T: " > "}, span{T: recv.Name(), V: a.varID(recv)}, span{T: ")."})
-		} else {
-			out = append(out, recvSpans...)
-			out = append(out, span{T: "."})
-		}
-		out = append(out, span{T: sel.Sel.Name})
-	} else {
-		out = append(out, a.exprSpans(p, call.Fun)...)
-	}
-	out = append(out, span{T: "("})
-	for i, arg := range call.Args {
-		if i > 0 {
-			out = append(out, span{T: ", "})
-		}
-		argSpans := a.exprSpans(p, arg)
-		out = append(out, argSpans...)
-		variadicTail := sig.Variadic() && i >= sig.Params().Len()-1
-		if i < sig.Params().Len() && !variadicTail {
-			if param := sig.Params().At(i); param.Name() != "" && param.Name() != "_" &&
-				spansText(argSpans) != param.Name() {
-				out = append(out, span{T: " > "}, span{T: param.Name(), V: a.varID(param)})
-			}
-		}
-	}
-	if call.Ellipsis.IsValid() {
-		out = append(out, span{T: "…"})
-	}
-	out = append(out, span{T: ")"})
-	return truncateSpans(out, 120)
-}
-
-// callKinds are the node kinds that render a call expression.
-var callKinds = map[string]bool{
-	"call": true, "interface-call": true, "func-value-call": true, "indirect-call": true,
-}
-
-// prependAssign shows the variable(s) that capture a call's result inline on
-// the call row ("rb = (…).WithOtel(ctx)"), so a trackable value's creation
-// point is visible instead of appearing out of nowhere at later uses. It only
-// fires when the rhs is itself a call and produced a call node.
-func (a *analyzer) prependAssign(p *packages.Package, lhs []ast.Expr, rhs ast.Expr, parent *node, before int) {
-	if _, ok := ast.Unparen(rhs).(*ast.CallExpr); !ok {
-		return
-	}
-	if len(parent.Kids) <= before {
-		return
-	}
-	target := parent.Kids[before]
-	if !callKinds[target.Kind] {
-		return
-	}
-	lhsSpans := a.lhsSpans(p, lhs)
-	if lhsSpans == nil {
-		return
-	}
-	spans := make([]span, 0, len(lhsSpans)+1+len(target.Spans))
-	spans = append(spans, lhsSpans...)
-	spans = append(spans, span{T: " = "})
-	spans = append(spans, target.Spans...)
-	target.Spans = spans
-	target.Text = spansText(spans)
-}
-
-// lhsSpans renders assignment targets ("rb", "x, y") as trackable variable
-// spans, skipping blank identifiers. Returns nil if nothing is trackable.
-func (a *analyzer) lhsSpans(p *packages.Package, lhs []ast.Expr) []span {
-	var out []span
-	n := 0
-	for _, l := range lhs {
-		if id, ok := ast.Unparen(l).(*ast.Ident); ok && id.Name == "_" {
-			continue
-		}
-		if n > 0 {
-			out = append(out, span{T: ", "})
-		}
-		out = append(out, a.exprSpans(p, l)...)
-		n++
-	}
-	if n == 0 {
-		return nil
-	}
-	return out
-}
-
-// staticCall handles a call whose target is a known function or method.
-func (a *analyzer) staticCall(p *packages.Package, call *ast.CallExpr, fn *types.Func, parent *node) {
-	if recv := fn.Signature().Recv(); recv != nil && types.IsInterface(recv.Type()) {
-		a.interfaceCall(p, call, fn, parent)
-		return
-	}
-	label := a.classify(fn.Pkg())
-	_, hasBody := a.funcs[fn.Origin()]
-	var spans []span
-	if label == "local" && hasBody {
-		spans = a.boundCallSpans(p, call, fn)
-	} else {
-		spans = a.callSpans(p, call)
-	}
-	if inst := a.instanceSuffix(p, call); inst != "" {
-		spans = append(spans, span{T: " " + inst})
-	}
-	n := parent.add(nodeWithSpans(a.relPos(call.Lparen), "call", label, spans))
-	if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok {
-		a.expr(p, sel.X, n) // receiver expression may itself contain calls
-	}
-	a.walkArgs(p, call, fn, n)
-	a.expand(fn, label, a.relPos(call.Lparen), n)
-}
-
-// interfaceCall handles a method call through an interface. It first tries to
-// resolve the concrete type(s) that actually flow into the receiver (via its
-// alias class); when the receiver stays abstract or its class is an
-// over-merged hub, it falls back to listing every implementation in the
-// module ("possible impl"). Local targets are traced into either way.
-func (a *analyzer) interfaceCall(p *packages.Package, call *ast.CallExpr, fn *types.Func, parent *node) {
-	label := a.classify(fn.Pkg())
-	n := parent.add(nodeWithSpans(a.relPos(call.Lparen), "interface-call", label, a.callSpans(p, call)))
-	if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok {
-		a.expr(p, sel.X, n)
-	}
-	a.walkArgs(p, call, nil, n)
-
-	iface, _ := fn.Signature().Recv().Type().Underlying().(*types.Interface)
-	if iface == nil {
-		return
-	}
-	if types.Identical(iface, types.Universe.Lookup("error").Type().Underlying()) {
-		n.note("error interface — implementations not enumerated")
-		return
-	}
-	// Prefer the concrete type(s) that actually flow into the receiver at this
-	// site. A tight alias class (few concretes) is a trustworthy resolution;
-	// an inflated one means the module-wide aliasing merged unrelated values,
-	// so we fall back to the honest "any implementer in the module" listing.
-	const maxResolved = 5
-	var resolved []*types.Func
-	if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok {
-		resolved = a.concreteImpls(p.TypesInfo, sel.X, iface, fn.Name())
-	}
-	resolved = dedupFuncs(resolved)
-	var impls []*types.Func
-	prefix := "impl: "
-	if len(resolved) > 0 && len(resolved) <= maxResolved {
-		impls = resolved
-	} else {
-		impls = dedupFuncs(a.implementations(iface, fn.Name()))
-		prefix = "possible impl: "
-	}
-	if len(impls) == 0 {
-		n.note("no implementations found in module")
-		return
-	}
-	const maxImpls = 8
-	for i, impl := range impls {
-		if i == maxImpls {
-			n.note("… and %d more implementations", len(impls)-maxImpls)
-			break
-		}
-		lbl := a.classify(impl.Pkg())
-		in := n.add(&node{Pos: a.relPos(impl.Pos()), Kind: "impl", Label: lbl,
-			Text: prefix + funcDisplayName(impl)})
-		a.expand(impl, lbl, a.relPos(call.Lparen), in)
-	}
 }
 
 // concreteImpls resolves the concrete type(s) that actually flow into an
@@ -647,30 +354,6 @@ func namedOf(t types.Type) *types.Named {
 	return n
 }
 
-// implementations finds every non-generic named type in the module that
-// satisfies iface, returning the corresponding method.
-func (a *analyzer) implementations(iface *types.Interface, method string) []*types.Func {
-	var out []*types.Func
-	for _, named := range a.named {
-		if named.TypeParams().Len() > 0 || types.IsInterface(named) {
-			continue
-		}
-		var recv types.Type = named
-		if !types.Implements(named, iface) {
-			ptr := types.NewPointer(named)
-			if !types.Implements(ptr, iface) {
-				continue
-			}
-			recv = ptr
-		}
-		obj, _, _ := types.LookupFieldOrMethod(recv, true, named.Obj().Pkg(), method)
-		if f, ok := obj.(*types.Func); ok {
-			out = append(out, f)
-		}
-	}
-	return out
-}
-
 // dedupFuncs removes duplicate methods that differ only by type-check pass
 // (a package and its test variant yield distinct *types.Func for the same
 // method), keyed by their display name.
@@ -686,49 +369,6 @@ func dedupFuncs(fns []*types.Func) []*types.Func {
 		out = append(out, f)
 	}
 	return out
-}
-
-// funcValueCall handles calling through a variable of function type.
-func (a *analyzer) funcValueCall(p *packages.Package, call *ast.CallExpr, v *types.Var, parent *node) {
-	n := parent.add(nodeWithSpans(a.relPos(call.Lparen), "func-value-call", "", a.callSpans(p, call)))
-	a.walkArgs(p, call, nil, n)
-	site, ok := a.defs[v]
-	if !ok {
-		n.note("callee unknown at analysis time")
-		return
-	}
-	switch d := site.node.(type) {
-	case *ast.Field:
-		n.note("func parameter %q of %s — concrete callee depends on caller",
-			v.Name(), a.enclosingFuncName(site.pkg, site.file, site.node.Pos()))
-		return
-	case *ast.AssignStmt, *ast.ValueSpec:
-		_ = d
-	default:
-		n.note("callee unknown at analysis time")
-		return
-	}
-	rhs := rhsForVar(site, v)
-	if rhs == nil {
-		n.notep(a.relPos(site.node.Pos()), "bound here — concrete callee not statically known")
-		return
-	}
-	switch r := ast.Unparen(rhs).(type) {
-	case *ast.FuncLit:
-		ln := n.add(&node{Pos: a.relPos(r.Pos()), Kind: "bound", Label: "local", Text: "bound to func literal"})
-		a.expandLit(site.pkg, r, a.relPos(call.Lparen), ln)
-	case *ast.Ident, *ast.SelectorExpr:
-		if fn, ok := exprObj(site.pkg.TypesInfo, r).(*types.Func); ok {
-			lbl := a.classify(fn.Pkg())
-			in := n.add(&node{Pos: a.relPos(fn.Pos()), Kind: "bound", Label: lbl,
-				Text: "bound to " + funcDisplayName(fn)})
-			a.expand(fn, lbl, a.relPos(call.Lparen), in)
-			return
-		}
-		n.notep(a.relPos(site.node.Pos()), "bound to %s — not statically resolvable", exprStr(rhs))
-	default:
-		n.notep(a.relPos(site.node.Pos()), "bound to %s — not statically resolvable", exprStr(rhs))
-	}
 }
 
 // rhsForVar finds the right-hand-side expression bound to v at its
@@ -770,10 +410,9 @@ func exprObj(info *types.Info, e ast.Expr) types.Object {
 	return nil
 }
 
-// expand traces into a callee's body if — and only if — it is local.
-// Stdlib and external-module calls are labeled but never entered. Each
-// body is expanded once per trace: later call sites reference the first
-// expansion instead of re-printing it (and re-numbering its loops).
+// expand traces into a callee's body if — and only if — it is local. Stdlib
+// and external-module calls are never entered. Each body is expanded once per
+// trace (later call sites show the call line with no nested body).
 func (a *analyzer) expand(fn *types.Func, label string, at string, n *node) {
 	if label != "local" {
 		return
@@ -784,53 +423,33 @@ func (a *analyzer) expand(fn *types.Func, label string, at string, n *node) {
 		return
 	}
 	if slices.Contains(a.stack, origin) {
-		n.note("recursive — already in call stack, not expanding")
-		return
+		return // recursion — stop silently
 	}
 	if _, done := a.expandedAt[origin]; done && !a.expandAll {
 		return
 	}
 	if len(a.stack) >= a.maxDepth {
-		n.note("… depth limit (%d) reached", a.maxDepth)
 		return
 	}
 	a.expandedAt[origin] = at
 	a.stack = append(a.stack, origin)
-	a.resultStack = append(a.resultStack, def.decl.Type.Results)
 	a.block(def.pkg, def.decl.Body, n)
-	a.resultStack = a.resultStack[:len(a.resultStack)-1]
 	a.stack = a.stack[:len(a.stack)-1]
 }
 
-// expandLit traces a function literal's body with depth protection
-// (literals aren't on the named-function cycle stack).
+// expandLit traces a function literal's body with depth protection (literals
+// aren't on the named-function cycle stack).
 func (a *analyzer) expandLit(p *packages.Package, lit *ast.FuncLit, at string, n *node) {
 	if _, done := a.expandedLits[lit]; done && !a.expandAll {
 		return
 	}
 	if len(a.stack)+a.litDepth >= a.maxDepth {
-		n.note("… depth limit (%d) reached", a.maxDepth)
 		return
 	}
 	a.expandedLits[lit] = at
 	a.litDepth++
-	a.resultStack = append(a.resultStack, lit.Type.Results)
 	a.block(p, lit.Body, n)
-	a.resultStack = a.resultStack[:len(a.resultStack)-1]
 	a.litDepth--
-}
-
-// walkArgs traces calls nested in the arguments and annotates them with an
-// origin row ("x ← make(…)") where the value was allocated. The caller→callee
-// name mapping is rendered inline in the call itself (see boundCallSpans), so
-// no separate "param ← arg" rows are emitted here.
-func (a *analyzer) walkArgs(p *packages.Package, call *ast.CallExpr, fn *types.Func, n *node) {
-	for _, arg := range call.Args {
-		a.expr(p, arg, n)
-	}
-	for _, arg := range call.Args {
-		a.annotateArg(p, arg, n)
-	}
 }
 
 func funcDisplayName(fn *types.Func) string {
@@ -842,42 +461,4 @@ func funcDisplayName(fn *types.Func) string {
 		return fn.Pkg().Name() + "." + fn.Name()
 	}
 	return fn.Name()
-}
-
-// instanceSuffix renders inferred/explicit type arguments for calls to
-// generic functions, e.g. "[int]".
-func (a *analyzer) instanceSuffix(p *packages.Package, call *ast.CallExpr) string {
-	var id *ast.Ident
-	switch f := ast.Unparen(call.Fun).(type) {
-	case *ast.Ident:
-		id = f
-	case *ast.SelectorExpr:
-		id = f.Sel
-	case *ast.IndexExpr:
-		id = funIdent(f.X)
-	case *ast.IndexListExpr:
-		id = funIdent(f.X)
-	}
-	if id == nil {
-		return ""
-	}
-	inst, ok := p.TypesInfo.Instances[id]
-	if !ok || inst.TypeArgs == nil || inst.TypeArgs.Len() == 0 {
-		return ""
-	}
-	parts := make([]string, inst.TypeArgs.Len())
-	for i := range inst.TypeArgs.Len() {
-		parts[i] = types.TypeString(inst.TypeArgs.At(i), types.RelativeTo(p.Types))
-	}
-	return "[" + strings.Join(parts, ", ") + "]"
-}
-
-func funIdent(e ast.Expr) *ast.Ident {
-	switch x := ast.Unparen(e).(type) {
-	case *ast.Ident:
-		return x
-	case *ast.SelectorExpr:
-		return x.Sel
-	}
-	return nil
 }

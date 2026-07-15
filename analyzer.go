@@ -57,9 +57,6 @@ type analyzer struct {
 	litDepth  int
 	nodeCount int
 	truncated bool
-	// resultStack is the result signature of each function/literal currently
-	// being expanded, so bare `return` rows can name the declared results.
-	resultStack []*ast.FieldList
 
 	// maxDepth and expandAll are tunable per request ("depth" and "expand"
 	// parameters on the TCP intake).
@@ -604,12 +601,6 @@ func (a *analyzer) findFunc(absFile string, line int) (*target, error) {
 	return nil, fmt.Errorf("%s is not part of the loaded module (root: %s)", absFile, a.modPath)
 }
 
-// enclosingFuncName names the function containing pos, for channel endpoint
-// reporting. Nested function literals are suffixed with ".func".
-func (a *analyzer) enclosingFuncName(p *packages.Package, f *ast.File, pos token.Pos) string {
-	name, _ := a.enclosingFuncInfo(p, f, pos)
-	return name
-}
 
 // enclosingFuncInfo returns the name and the position of the innermost
 // function (declaration or literal) containing pos. The position uniquely

@@ -15,6 +15,7 @@
   --green: #57ab5a;
   --cyan: #39c5cf;
   --violet: #b083f0;
+  --kw: #c586c0;
   --orange: #e0823d;
 }
 
@@ -465,26 +466,16 @@ body {
   padding: 0;
 }
 
-/* code keywords rendered inline instead of badges — reads like source. */
+/* Go keywords, one syntax color like a real editor. */
 .kw {
+  color: var(--kw);
   font-weight: 600;
-  margin-right: 5px;
 }
 
-.kw-go {
-  color: var(--amber);
-}
-
-.kw-defer {
-  color: var(--orange);
-}
-
-.kw-select {
-  color: var(--cyan);
-}
-
-.kw-return {
-  color: var(--err);
+/* dispatch/info lines shown as source comments in code view. */
+.code-comment {
+  color: var(--dimmer);
+  font-style: italic;
 }
 
 .b-race {
@@ -643,6 +634,19 @@ body {
 
 .k-chan-close .text {
   color: var(--err);
+}
+
+/* Code view: read as plain source — no dim-italic control flow, no whole-line
+   channel tints. Only keywords, tracked variables and comments carry color.
+   (Variable spans keep their own color; these rules only touch the .text.) */
+.tree.code .k-branch .text,
+.tree.code .k-case .text,
+.tree.code .k-select .text,
+.tree.code .k-chan-send .text,
+.tree.code .k-chan-recv .text,
+.tree.code .k-chan-close .text {
+  color: var(--fg);
+  font-style: normal;
 }
 
 /* ---------- error + legend ---------- */
