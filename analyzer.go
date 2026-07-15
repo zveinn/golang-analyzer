@@ -48,6 +48,10 @@ type analyzer struct {
 	src map[string][]byte
 	// named is every non-generic named type in the module, for interface dispatch.
 	named []*types.Named
+	// classConcretes maps an alias-class root to the concrete (non-interface)
+	// types observed in that class, so interface-call sites can resolve the
+	// actual implementation(s) that flow into the receiver. Built lazily.
+	classConcretes map[any][]types.Type
 
 	stack     []*types.Func
 	litDepth  int

@@ -522,9 +522,11 @@ func (a *analyzer) staticCall(p *packages.Package, call *ast.CallExpr, fn *types
 	a.expand(fn, label, a.relPos(call.Lparen), n)
 }
 
-// interfaceCall handles a method call through an interface: the concrete
-// target is unknown statically, so every implementation in the module is
-// listed (and traced, when local).
+// interfaceCall handles a method call through an interface. It first tries to
+// resolve the concrete type(s) that actually flow into the receiver (via its
+// alias class); when the receiver stays abstract or its class is an
+// over-merged hub, it falls back to listing every implementation in the
+// module ("possible impl"). Local targets are traced into either way.
 func (a *analyzer) interfaceCall(p *packages.Package, call *ast.CallExpr, fn *types.Func, parent *node) {
 	label := a.classify(fn.Pkg())
 	n := parent.add(nodeWithSpans(a.relPos(call.Lparen), "interface-call", label, a.callSpans(p, call)))
@@ -541,7 +543,24 @@ func (a *analyzer) interfaceCall(p *packages.Package, call *ast.CallExpr, fn *ty
 		n.note("error interface — implementations not enumerated")
 		return
 	}
-	impls := a.implementations(iface, fn.Name())
+	// Prefer the concrete type(s) that actually flow into the receiver at this
+	// site. A tight alias class (few concretes) is a trustworthy resolution;
+	// an inflated one means the module-wide aliasing merged unrelated values,
+	// so we fall back to the honest "any implementer in the module" listing.
+	const maxResolved = 5
+	var resolved []*types.Func
+	if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok {
+		resolved = a.concreteImpls(p.TypesInfo, sel.X, iface, fn.Name())
+	}
+	resolved = dedupFuncs(resolved)
+	var impls []*types.Func
+	prefix := "impl: "
+	if len(resolved) > 0 && len(resolved) <= maxResolved {
+		impls = resolved
+	} else {
+		impls = dedupFuncs(a.implementations(iface, fn.Name()))
+		prefix = "possible impl: "
+	}
 	if len(impls) == 0 {
 		n.note("no implementations found in module")
 		return
@@ -554,9 +573,78 @@ func (a *analyzer) interfaceCall(p *packages.Package, call *ast.CallExpr, fn *ty
 		}
 		lbl := a.classify(impl.Pkg())
 		in := n.add(&node{Pos: a.relPos(impl.Pos()), Kind: "impl", Label: lbl,
-			Text: "possible impl: " + funcDisplayName(impl)})
+			Text: prefix + funcDisplayName(impl)})
 		a.expand(impl, lbl, a.relPos(call.Lparen), in)
 	}
+}
+
+// concreteImpls resolves the concrete type(s) that actually flow into an
+// interface-call receiver by scanning its alias class for concrete
+// (non-interface) types implementing the interface. Empty when the receiver
+// stays fully abstract (no concrete value pinned down in the module).
+func (a *analyzer) concreteImpls(info *types.Info, recv ast.Expr, iface *types.Interface, method string) []*types.Func {
+	key := a.aliasKey(info, recv)
+	if key == nil {
+		return nil
+	}
+	a.buildClassConcretes()
+	seen := map[*types.Func]bool{}
+	var out []*types.Func
+	for _, t := range a.classConcretes[a.find(key)] {
+		named := namedOf(t)
+		if named == nil || named.TypeParams().Len() > 0 {
+			continue
+		}
+		recvT := t
+		if !types.Implements(recvT, iface) {
+			ptr := types.NewPointer(named)
+			if !types.Implements(ptr, iface) {
+				continue
+			}
+			recvT = ptr
+		}
+		if obj, _, _ := types.LookupFieldOrMethod(recvT, true, named.Obj().Pkg(), method); obj != nil {
+			if f, ok := obj.(*types.Func); ok && !seen[f] {
+				seen[f] = true
+				out = append(out, f)
+			}
+		}
+	}
+	return out
+}
+
+// buildClassConcretes groups every concrete type in the module by its alias
+// class root, once. Unions are frozen after indexing, so roots are stable.
+func (a *analyzer) buildClassConcretes() {
+	if a.classConcretes != nil {
+		return
+	}
+	a.classConcretes = map[any][]types.Type{}
+	for k := range a.aliasParent {
+		var t types.Type
+		switch v := k.(type) {
+		case *types.Var:
+			t = v.Type()
+		case resultKey:
+			if res := v.fn.Signature().Results(); v.idx < res.Len() {
+				t = res.At(v.idx).Type()
+			}
+		}
+		if t == nil || types.IsInterface(t) || namedOf(t) == nil {
+			continue
+		}
+		r := a.find(k)
+		a.classConcretes[r] = append(a.classConcretes[r], t)
+	}
+}
+
+// namedOf returns the named type of t, dereferencing a single pointer.
+func namedOf(t types.Type) *types.Named {
+	if ptr, ok := t.(*types.Pointer); ok {
+		t = ptr.Elem()
+	}
+	n, _ := t.(*types.Named)
+	return n
 }
 
 // implementations finds every non-generic named type in the module that
@@ -579,6 +667,23 @@ func (a *analyzer) implementations(iface *types.Interface, method string) []*typ
 		if f, ok := obj.(*types.Func); ok {
 			out = append(out, f)
 		}
+	}
+	return out
+}
+
+// dedupFuncs removes duplicate methods that differ only by type-check pass
+// (a package and its test variant yield distinct *types.Func for the same
+// method), keyed by their display name.
+func dedupFuncs(fns []*types.Func) []*types.Func {
+	seen := map[string]bool{}
+	out := fns[:0]
+	for _, f := range fns {
+		name := funcDisplayName(f)
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, f)
 	}
 	return out
 }
@@ -682,8 +787,7 @@ func (a *analyzer) expand(fn *types.Func, label string, at string, n *node) {
 		n.note("recursive — already in call stack, not expanding")
 		return
 	}
-	if first, done := a.expandedAt[origin]; done && !a.expandAll {
-		n.notep(first, "body already traced (at first call site)")
+	if _, done := a.expandedAt[origin]; done && !a.expandAll {
 		return
 	}
 	if len(a.stack) >= a.maxDepth {
@@ -701,8 +805,7 @@ func (a *analyzer) expand(fn *types.Func, label string, at string, n *node) {
 // expandLit traces a function literal's body with depth protection
 // (literals aren't on the named-function cycle stack).
 func (a *analyzer) expandLit(p *packages.Package, lit *ast.FuncLit, at string, n *node) {
-	if first, done := a.expandedLits[lit]; done && !a.expandAll {
-		n.notep(first, "body already traced (at first call site)")
+	if _, done := a.expandedLits[lit]; done && !a.expandAll {
 		return
 	}
 	if len(a.stack)+a.litDepth >= a.maxDepth {
